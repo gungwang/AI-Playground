@@ -1,5 +1,8 @@
 # 古武 AI 游乐场（Gungwang AI Playground）
 
+下载 Windows 11 可执行安装文件： 
+https://github.com/gungwang/AI-Playground/releases/download/3.2.1/Gungwang.AI.Playground-3.2.1.exe
+
 欢迎来到**古武 AI 游乐场** - 基于英特尔 AI Playground 的定制化、无限制本地 AI 生成套件。这是您的云端工具离线替代方案，**无内容限制**，完美适合创意专业人士和 AI 爱好者。
 
 ![古武 AI 游乐场界面](./Gungwang-AiPlaygound-3.2.0.beta.png)
