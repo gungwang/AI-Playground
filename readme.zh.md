@@ -147,4 +147,53 @@ AI Playground不预装任何生成式AI模型，但可以通过应用程序界�
 
 ---
 
+## 本地服务访问地址
+
+运行AI Playground时，多个后端服务会在本地启动。以下是它们的地址和端口信息：
+
+### 活动服务端口
+
+| 服务 | 本地地址 | 端口 | 说明 |
+|------|--------|------|------|
+| **AI后端（聊天/LLM）** | `http://localhost:59000` | 59000 | 主要的LLM推理服务，用于聊天功能 |
+| **ComfyUI后端** | `http://localhost:49350` | 49350 | 图像生成服务 |
+| **辅助后端** | `http://localhost:49351` | 49351 | OpenVINO或Llama.cpp推理服务 |
+
+### API 调用示例
+
+**检查聊天服务健康状态：**
+```bash
+curl http://localhost:59000/healthy
+```
+
+**检查图像生成服务健康状态：**
+```bash
+curl http://localhost:49350/healthy
+```
+
+所有后端服务仅在本地可访问，确保数据隐私和安全。
+
+---
+
 **祝你使用愉快！** 🚀
+
+
+AI Playground's exact local URLs:
+
+Active Service Ports
+Service	URL	Port	Process ID
+AI Backend (Chat/LLM)	http://localhost:59000	59000	11168
+ComfyUI Backend	http://localhost:49350	49350	25332
+Secondary Backend	http://localhost:49351	49351	12028
+Using the APIs
+For Chat API calls:
+
+For Image Generation (ComfyUI):
+
+The three active ports are:
+
+59000 — Your main LLM/Chat inference service
+49350 — ComfyUI image generation service
+49351 — Secondary backend (OpenVINO or Llama.cpp)
+You can test these with a quick health check:
+

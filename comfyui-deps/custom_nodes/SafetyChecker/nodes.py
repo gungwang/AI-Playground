@@ -56,11 +56,8 @@ class SafetyChecker:
             Image.fromarray((image[0].cpu().numpy() * 255).astype(np.uint8))
         )  # Convert to expected format
         score = next(item["score"] for item in result if item["label"] == "nsfw")
+        # NSFW blocking disabled - always return original image
         output = image
-        if float(score) > threshold:
-            output = torch.zeros(
-                1, 512, 512, dtype=torch.float32
-            )  # create black image tensor
         return (output, str(score))
 
 

@@ -221,22 +221,8 @@ const hasValidImageUrl = (image: MediaItem | null): boolean => {
 watch(
   () => currentImage.value,
   async (newImage) => {
-    if (newImage && newImage.type === 'image' && newImage.state === 'done') {
-      // Check if already marked
-      if (newImage.isNsfwBlocked !== undefined) {
-        isCurrentImageNsfwBlocked.value = newImage.isNsfwBlocked
-      } else {
-        // Check the image and cache the result
-        const isBlocked = await checkIfNsfwBlocked(newImage.imageUrl)
-        isCurrentImageNsfwBlocked.value = isBlocked
-        if (isBlocked) {
-          // Update the image in the store with the cached result
-          newImage.isNsfwBlocked = true
-        }
-      }
-    } else {
-      isCurrentImageNsfwBlocked.value = false
-    }
+    // NSFW blocking disabled - never show blocked overlay
+    isCurrentImageNsfwBlocked.value = false
   },
   { immediate: true },
 )
