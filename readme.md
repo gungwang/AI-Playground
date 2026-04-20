@@ -1,7 +1,7 @@
 # Gungwang AI Playground improved from Intel AI Playground
 
 Download Windows 11 installation file: 
-https://github.com/gungwang/AI-Playground/releases/download/3.2.4/Gungwang.AI.Playground-3.2.4.exe
+https://github.com/gungwang/AI-Playground/releases/download/v3.2.4/Gungwang.AI.Playground-3.2.4.exe
 
 ![NSFW demo 16:9 (2026)](./NSFW-2026-4-16x9.gif)
 

@@ -1,7 +1,7 @@
 # Gungwang AI Playground
 
 Download Windows 11 installation file: 
-https://github.com/gungwang/AI-Playground/releases/download/3.2.4/Gungwang.AI.Playground-3.2.4.exe
+https://github.com/gungwang/AI-Playground/releases/download/v3.2.4/Gungwang.AI.Playground-3.2.4.exe
 
 Welcome to **Gungwang AI Playground** - A customized, unrestricted local AI generation suite built on Intel's AI Playground. This is your offline alternative to cloud-based AI tools with **no content restrictions**, perfect for creative professionals and AI enthusiasts.
 
