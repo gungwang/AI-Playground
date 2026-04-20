@@ -67,7 +67,7 @@ const HIGH_MEMORY_PRESETS = new Set([
 ])
 
 /** Presets for video generation (best on discrete GPUs with 16GB+ vRAM) */
-const VIDEO_VRAM_PRESETS = new Set(['LTX-Video', 'Wan2.1-VACE'])
+const VIDEO_VRAM_PRESETS = new Set(['LTX-Video', 'Wan2.1-VACE', 'Wan2.2'])
 
 const MEMORY_ALERT_SUPPRESS_PREFIX = 'memoryAlertSuppress_'
 

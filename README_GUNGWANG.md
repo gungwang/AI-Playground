@@ -1,7 +1,7 @@
 # Gungwang AI Playground
 
 Download Windows 11 installation file: 
-https://github.com/gungwang/AI-Playground/releases/download/3.2.1/Gungwang.AI.Playground-3.2.1.exe
+https://github.com/gungwang/AI-Playground/releases/download/3.2.2/Gungwang.AI.Playground-3.2.2.exe
 
 Welcome to **Gungwang AI Playground** - A customized, unrestricted local AI generation suite built on Intel's AI Playground. This is your offline alternative to cloud-based AI tools with **no content restrictions**, perfect for creative professionals and AI enthusiasts.
 
@@ -9,7 +9,7 @@ Welcome to **Gungwang AI Playground** - A customized, unrestricted local AI gene
 
 ## 🎯 What's Different in Gungwang Edition?
 
-### Key Customizations (v3.2.1)
+### Key Customizations (v3.2.2)
 
 ✅ **NSFW Content Unrestricted** - Generate any content without safety filters  
 ✅ **No Upload Required** - Everything runs 100% locally on your PC  
@@ -25,10 +25,10 @@ Welcome to **Gungwang AI Playground** - A customized, unrestricted local AI gene
    - Frontend no longer shows "NSFW Result Blocked" overlay
    - **Files modified:** `comfyui-deps/custom_nodes/SafetyChecker/nodes.py`, `WebUI/src/views/WorkflowResult.vue`
 
-2. **Version Bump to 3.2.1**
+2. **Version Bump to 3.2.2**
    - Updated from 3.2.0-beta
    - Package.json, Package-lock.json, readme.md updated
-   - Download links point to v3.2.1 release
+   - Download links point to v3.2.2 release
 
 3. **Enhanced Documentation**
    - Added local service URL reference
@@ -102,7 +102,7 @@ See the power of unrestricted generation:
 ## 💻 Getting Started
 
 ### 1. Installation
-Download and install from: [AI Playground v3.2.1 Installer](https://github.com/intel/AI-Playground/releases)
+Download and install from: [AI Playground v3.2.2 Installer](https://github.com/intel/AI-Playground/releases)
 
 ### 2. First Run
 - App will guide you through backend component setup
@@ -142,7 +142,7 @@ Python backends start automatically with `npm run dev`:
 
 ## 📝 Changelog - Gungwang Edition
 
-### v3.2.1
+### v3.2.2
 - ✅ Disabled NSFW safety filter completely
 - ✅ Removed "NSFW Result Blocked" overlay
 - ✅ Version bump from 3.2.0-beta
@@ -232,5 +232,40 @@ Model licenses vary - always check before use in production.
 ---
 
 **Last Updated:** April 18, 2026  
-**Version:** 3.2.1  
+**Version:** 3.2.2  
 **Status:** Stable
+
+---
+
+## Update - April 20, 2026
+
+### Today's Changes
+
+- Added Wan 2.2 video support to AI Playground as a new preset: `Wan2.2`
+- Added two selectable Wan 2.2 variants inside the existing preset selector:
+   - `TI2V-5B`
+   - `Wan-AI 14B`
+- Integrated the Wan 2.2 workflows into the app's preset-driven ComfyUI pipeline
+- Registered `Wan2.2` in the video VRAM warning list so users get the same high-memory warning shown for other heavy video presets
+- Bumped the project version from `3.2.1` to `3.2.2` in package metadata and release-facing docs
+
+### Summary
+
+- Wan 2.2 is now exposed directly inside the app instead of requiring a separate manual ComfyUI workflow
+- `TI2V-5B` is the practical default path for Intel Arc A770 16GB class GPUs
+- `Wan-AI 14B` is available as a heavier image-to-video option for users who want the larger model path
+- The bundled ComfyUI already included native Wan 2.2 node support, so no extra custom node installation was required for this feature
+
+### Solutions Implemented
+
+- Converted the official Wan 2.2 workflows into AI Playground `comfyUiApiWorkflow` preset format
+- Used the existing preset variant system instead of adding new frontend UI, keeping the implementation small and aligned with the current app design
+- Flattened the 14B workflow into a direct two-pass API workflow so it works cleanly with the app's preset execution path
+- Reused existing model path handling for `text_encoders` and `clip` compatibility, which matches the bundled ComfyUI folder path aliases
+- Added the preset to the high-VRAM gating list to reduce confusion for users running heavy video models
+
+### Validation Status
+
+- Preset JSON and version metadata updates were applied successfully
+- File-level validation passed for the edited preset and version files
+- End-to-end runtime generation with both Wan 2.2 variants should still be verified inside the app on target hardware
