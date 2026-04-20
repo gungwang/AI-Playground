@@ -241,31 +241,26 @@ Model licenses vary - always check before use in production.
 
 ### Today's Changes
 
-- Added Wan 2.2 video support to AI Playground as a new preset: `Wan2.2`
-- Added two selectable Wan 2.2 variants inside the existing preset selector:
-   - `TI2V-5B`
-   - `Wan-AI 14B`
-- Integrated the Wan 2.2 workflows into the app's preset-driven ComfyUI pipeline
-- Registered `Wan2.2` in the video VRAM warning list so users get the same high-memory warning shown for other heavy video presets
-- Bumped the project version from `3.2.1` to `3.2.2` in package metadata and release-facing docs
+- Simplified `Wan2.2` back to a single TI2V-5B image-to-video preset
+- Removed the 14B `Text2Video` and `Start2End` paths because they forced large Wan 2.2 14B downloads and were not the intended setup for this app
+- Kept `Wan2.2` in the video VRAM warning list
+- Updated both the source preset and the packaged preset copy so the current built app stops requesting Wan 2.2 14B models
 
 ### Summary
 
-- Wan 2.2 is now exposed directly inside the app instead of requiring a separate manual ComfyUI workflow
-- `TI2V-5B` is the practical default path for Intel Arc A770 16GB class GPUs
-- `Wan-AI 14B` is available as a heavier image-to-video option for users who want the larger model path
-- The bundled ComfyUI already included native Wan 2.2 node support, so no extra custom node installation was required for this feature
+- Wan 2.2 now uses only the TI2V-5B image-to-video workflow in this app
+- The preset no longer requests Wan 2.2 14B text-to-video or start-to-end models
+- The remaining required downloads are the TI2V-5B workflow and its shared Wan text encoder and VAE dependencies
 
 ### Solutions Implemented
 
-- Converted the official Wan 2.2 workflows into AI Playground `comfyUiApiWorkflow` preset format
-- Used the existing preset variant system instead of adding new frontend UI, keeping the implementation small and aligned with the current app design
-- Flattened the 14B workflow into a direct two-pass API workflow so it works cleanly with the app's preset execution path
-- Reused existing model path handling for `text_encoders` and `clip` compatibility, which matches the bundled ComfyUI folder path aliases
-- Added the preset to the high-VRAM gating list to reduce confusion for users running heavy video models
+- Removed every 14B variant from the `Wan2.2` preset instead of trying to special-case the download dialog
+- Kept the stable TI2V-5B ComfyUI workflow, which matches the intended Intel Arc A770 16GB usage
+- Synced the same fix into the packaged `build/electron/win-unpacked` preset copy so the current built executable behaves the same way as source
 
 ### Validation Status
 
-- Preset JSON and version metadata updates were applied successfully
+- Preset JSON and documentation updates were applied successfully
+- Wan2.2 now validates as a TI2V-5B-only preset with no 14B model references in the preset file
 - File-level validation passed for the edited preset and version files
 - End-to-end runtime generation with both Wan 2.2 variants should still be verified inside the app on target hardware
