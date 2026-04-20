@@ -1,7 +1,7 @@
 # 古武 AI 游乐场（Gungwang AI Playground）
 
 下载 Windows 11 可执行安装文件： 
-https://github.com/gungwang/AI-Playground/releases/download/3.2.2/Gungwang.AI.Playground-3.2.2.exe
+https://github.com/gungwang/AI-Playground/releases/download/3.2.4/Gungwang.AI.Playground-3.2.4.exe
 
 欢迎来到**古武 AI 游乐场** - 基于英特尔 AI Playground 的定制化、无限制本地 AI 生成套件。这是您的云端工具离线替代方案，**无内容限制**，完美适合创意专业人士和 AI 爱好者。
 
@@ -9,7 +9,7 @@ https://github.com/gungwang/AI-Playground/releases/download/3.2.2/Gungwang.AI.Pl
 
 ## 🎯 古武版有什么不同？
 
-### 主要定制功能（v3.2.2）
+### 主要定制功能（v3.2.4）
 
 ✅ **NSFW 内容无限制** - 无安全过滤，生成任何内容  
 ✅ **无需上传** - 100% 本地运行  
@@ -25,10 +25,10 @@ https://github.com/gungwang/AI-Playground/releases/download/3.2.2/Gungwang.AI.Pl
    - 前端不再显示"NSFW 结果被阻止"覆盖
    - **修改文件：** `comfyui-deps/custom_nodes/SafetyChecker/nodes.py`, `WebUI/src/views/WorkflowResult.vue`
 
-2. **版本更新至 3.2.2**
+2. **版本更新至 3.2.4**
    - 从 3.2.0-beta 升级
    - 更新 Package.json、Package-lock.json、readme.md
-   - 下载链接指向 v3.2.2 版本
+   - 下载链接指向 v3.2.4 版本
 
 3. **新增 Wan 2.2 三模式视频支持**
    - 添加新的 `Wan2.2` 视频预设
@@ -108,7 +108,7 @@ curl http://localhost:49350/healthy
 ## 💻 快速开始
 
 ### 1. 安装
-下载和安装：[古武 AI Playground v3.2.2 安装程序](https://github.com/gungwang/AI-Playground/releases)
+下载和安装：[古武 AI Playground v3.2.4 安装程序](https://github.com/gungwang/AI-Playground/releases)
 
 ### 2. 首次运行
 - 应用将引导您完成后端组件设置
@@ -195,7 +195,7 @@ AI Playground 不会预装全部生成式 AI 模型。模型可以通过应用�
 
 ## 📝 更新日志 - 古武版
 
-### v3.2.2
+### v3.2.4
 - ✅ 完全禁用 NSFW 安全过滤
 - ✅ 移除"NSFW 结果被阻止"覆盖
 - ✅ 从 3.2.0-beta 版本升级
@@ -285,7 +285,7 @@ AI Playground 不会预装全部生成式 AI 模型。模型可以通过应用�
 ---
 
 **最后更新：** 2026 年 4 月 20 日  
-**版本：** 3.2.2  
+**版本：** 3.2.4  
 **状态：** 稳定
 
 ---

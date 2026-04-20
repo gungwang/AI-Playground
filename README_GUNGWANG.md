@@ -1,7 +1,7 @@
 # Gungwang AI Playground
 
 Download Windows 11 installation file: 
-https://github.com/gungwang/AI-Playground/releases/download/3.2.2/Gungwang.AI.Playground-3.2.2.exe
+https://github.com/gungwang/AI-Playground/releases/download/3.2.4/Gungwang.AI.Playground-3.2.4.exe
 
 Welcome to **Gungwang AI Playground** - A customized, unrestricted local AI generation suite built on Intel's AI Playground. This is your offline alternative to cloud-based AI tools with **no content restrictions**, perfect for creative professionals and AI enthusiasts.
 
@@ -9,7 +9,7 @@ Welcome to **Gungwang AI Playground** - A customized, unrestricted local AI gene
 
 ## 🎯 What's Different in Gungwang Edition?
 
-### Key Customizations (v3.2.2)
+### Key Customizations (v3.2.4)
 
 ✅ **NSFW Content Unrestricted** - Generate any content without safety filters  
 ✅ **No Upload Required** - Everything runs 100% locally on your PC  
@@ -25,10 +25,10 @@ Welcome to **Gungwang AI Playground** - A customized, unrestricted local AI gene
    - Frontend no longer shows "NSFW Result Blocked" overlay
    - **Files modified:** `comfyui-deps/custom_nodes/SafetyChecker/nodes.py`, `WebUI/src/views/WorkflowResult.vue`
 
-2. **Version Bump to 3.2.2**
+2. **Version Bump to 3.2.4**
    - Updated from 3.2.0-beta
    - Package.json, Package-lock.json, readme.md updated
-   - Download links point to v3.2.2 release
+   - Download links point to v3.2.4 release
 
 3. **Enhanced Documentation**
    - Added local service URL reference
@@ -102,7 +102,7 @@ See the power of unrestricted generation:
 ## 💻 Getting Started
 
 ### 1. Installation
-Download and install from: [AI Playground v3.2.2 Installer](https://github.com/intel/AI-Playground/releases)
+Download and install from: [AI Playground v3.2.4 Installer](https://github.com/intel/AI-Playground/releases)
 
 ### 2. First Run
 - App will guide you through backend component setup
@@ -142,7 +142,7 @@ Python backends start automatically with `npm run dev`:
 
 ## 📝 Changelog - Gungwang Edition
 
-### v3.2.2
+### v3.2.4
 - ✅ Disabled NSFW safety filter completely
 - ✅ Removed "NSFW Result Blocked" overlay
 - ✅ Version bump from 3.2.0-beta
@@ -232,7 +232,7 @@ Model licenses vary - always check before use in production.
 ---
 
 **Last Updated:** April 18, 2026  
-**Version:** 3.2.2  
+**Version:** 3.2.4  
 **Status:** Stable
 
 ---
