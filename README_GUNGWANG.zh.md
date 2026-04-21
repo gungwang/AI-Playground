@@ -323,3 +323,13 @@ netstat -ano | findstr LISTENING
 
 $ ./llama-server
 load_backend: loaded RPC backend from 
+
+Git Bash version (slashes instead of backslashes):
+./llama-server \
+  --model "/c/AI/AI Playground/Gungwang AI Playground/resources/models/LLM/ggufLLM/unsloth---Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_S.gguf" \
+  --port 8080 \
+  --ctx-size 8192 \
+  --threads 8 \
+  --gpu-layers 50
+
+http://127.0.0.1:8080
