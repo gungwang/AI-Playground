@@ -316,3 +316,10 @@ AI Playground 不会预装全部生成式 AI 模型。模型可以通过应用�
 - 预设 JSON 与说明文档已同步更新
 - `Wan2.2` 预设文件中已不再包含 14B 模型引用
 
+Check Port:
+cd /c/AI/intel-ai/AI-Playground/LlamaCPP/llama-cpp (dev.5)
+
+netstat -ano | findstr LISTENING
+
+$ ./llama-server
+load_backend: loaded RPC backend from 
