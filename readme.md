@@ -24,3 +24,11 @@ See the power of unrestricted generation:
 
 *Generated without safety filters - full creative freedom*
 
+=====================================
+
+local site:
+http://127.0.0.1:39100/
+
+http://127.0.0.1:39100/v1/chat/completions
+http://127.0.0.1:39100/v1/completions
+http://127.0.0.1:39100/v1/models
