@@ -1,14 +1,31 @@
 import { ChildProcess, spawn } from 'node:child_process'
 import path from 'node:path'
 import * as filesystem from 'fs-extra'
-import { app, BrowserWindow, net } from 'electron'
+import { app, BrowserWindow, dialog, net } from 'electron'
 import { appLoggerInstance } from '../logging/logger.ts'
+import { packagedResourcesRoot } from '../aipgRoot.ts'
 import { ApiService, createEnhancedErrorDetails, ErrorDetails } from './service.ts'
 import { promisify } from 'util'
 import { exec } from 'child_process'
 import { LocalSettings } from '../main.ts'
 import getPort, { portNumbers } from 'get-port'
-import { installBackend } from './uvBasedBackends/uv.ts'
+import { ensureManagedPython, installBackend, uvPipInstallToTarget } from './uvBasedBackends/uv.ts'
+import { binary, extract, restoreTreeWritePermissions } from './tools.ts'
+import { getBundledBackendVersionSync, resolveModels } from '../remoteUpdates.ts'
+import {
+  terminateProcessTree as killProcessTree,
+  waitForServerReadyOrThrow,
+} from './processLifecycle.ts'
+import {
+  getMissingPackages,
+  hasAptGet,
+  hasPkexec,
+  parseAptMissingPackages,
+  resolvePackageList,
+  runPkexecInstall,
+  waitForTerminalInstall,
+} from './linuxPackageInstaller.ts'
+import { resolveDefaultDevice } from './defaultDeviceSelection.ts'
 
 const execAsync = promisify(exec)
 
@@ -16,7 +33,7 @@ interface OvmsServerProcess {
   process: ChildProcess
   port: number
   modelRepoId: string
-  type: 'llm' | 'embedding' | 'transcription'
+  type: 'llm' | 'embedding' | 'transcription' | 'speech' | 'image_generation'
   contextSize?: number
   isReady: boolean
   healthEndpointUrl: string
@@ -31,12 +48,13 @@ export class OpenVINOBackendService implements ApiService {
   readonly settings: LocalSettings
 
   // Service directories
-  readonly baseDir = app.isPackaged ? process.resourcesPath : path.join(__dirname, '../../../')
+  readonly baseDir = app.isPackaged ? packagedResourcesRoot() : path.join(__dirname, '../../../')
   readonly serviceDir: string
   readonly ovmsDir: string
   readonly ovmsExePath: string
   readonly pythonEnvDir: string
   readonly detectDevicesScript: string
+  readonly versionMarkerPath: string
 
   readonly zipPath: string
   devices: InferenceDevice[] = [{ id: 'AUTO', name: 'Auto select device', selected: true }]
@@ -54,13 +72,34 @@ export class OpenVINOBackendService implements ApiService {
   private ovmsLlmProcess: OvmsServerProcess | null = null
   private ovmsEmbeddingProcess: OvmsServerProcess | null = null
   private ovmsTranscriptionProcess: OvmsServerProcess | null = null
+  private ovmsSpeechProcess: OvmsServerProcess | null = null
+  private ovmsImageProcess: OvmsServerProcess | null = null
   private currentModel: string | null = null
   private currentContextSize: number | null = null
   private currentEmbeddingModel: string | null = null
   private currentTranscriptionModel: string | null = null
+  private currentSpeechModel: string | null = null
+  private currentImageModel: string | null = null
+  private currentImageResolution: string | null = null
+
+  // OVMS --kv_cache_precision for the LLM (text_generation) server.
+  // '' means use OVMS's default; 'u4' enables INT4 KV cache compression.
+  private kvCachePrecision: string = ''
 
   // Store last startup error details for persistence
   private lastStartupErrorDetails: ErrorDetails | null = null
+
+  // Cached extra LD_LIBRARY_PATH directories resolved from ldconfig (Linux only)
+  private cachedOvmsExtraLibPaths: string[] | null = null
+
+  // Linux only: PYTHONHOME pointing at a managed CPython that matches the OVMS
+  // build's libpython soname (e.g. 3.12). Set during resolveOvmsExtraLibPaths().
+  private ovmsEmbeddedPythonHome: string | null = null
+
+  // The OVMS ubuntu24 build is linked against libpython3.12.so.1.0 and uses
+  // CPython-3.12 internal symbols (e.g. _PyThreadState_UncheckedGet), so it MUST
+  // run against a genuine 3.12 runtime regardless of the host distro's Python.
+  private static readonly OVMS_EMBEDDED_PYTHON_VERSION = '3.12'
 
   // Cached installed version for inclusion in service info updates
   private cachedInstalledVersion: { version: string; releaseTag?: string } | undefined = undefined
@@ -68,8 +107,26 @@ export class OpenVINOBackendService implements ApiService {
   // Logger
   readonly appLogger = appLoggerInstance
 
-  private version = '2026.1.0'
-  private releaseTag: string | undefined = '72cc0624'
+  // Build-time default sourced from the shipped backend-versions.json (single
+  // source of truth). The UI overrides these via updateSettings() with the
+  // resolved/overridden version before set_up() runs.
+  private version: string | undefined = getBundledBackendVersionSync('openvino-backend')?.version
+  private releaseTag: string | undefined =
+    getBundledBackendVersionSync('openvino-backend')?.releaseTag
+  private readonly linuxRuntimePackages = [
+    'python3',
+    'python3-venv',
+    'libtbb12',
+    'libhwloc15',
+    'libgomp1',
+    'libnuma1',
+    'ocl-icd-libopencl1',
+  ]
+
+  private readonly linuxAlternativePackages = [
+    ['libfuse2t64', 'libfuse2'],
+    ['libpython3.12t64', 'libpython3.12', 'python3.12', 'python3.12-minimal'],
+  ]
 
   constructor(name: BackendServiceName, port: number, win: BrowserWindow, settings: LocalSettings) {
     this.name = name
@@ -82,10 +139,17 @@ export class OpenVINOBackendService implements ApiService {
     // Set up paths
     this.serviceDir = path.resolve(path.join(this.baseDir, 'OpenVINO'))
     this.ovmsDir = path.resolve(path.join(this.serviceDir, 'ovms'))
-    this.ovmsExePath = path.resolve(path.join(this.ovmsDir, 'ovms.exe'))
-    this.zipPath = path.resolve(path.join(this.serviceDir, 'ovms.zip'))
+    // On Windows the binary sits at the OVMS root; on Linux/macOS it lives under bin/
+    const ovmsExe = process.platform === 'win32' ? 'ovms.exe' : path.join('bin', binary('ovms'))
+    this.ovmsExePath = path.resolve(path.join(this.ovmsDir, ovmsExe))
+    const archiveName = process.platform === 'win32' ? 'ovms.zip' : 'ovms.tar.gz'
+    this.zipPath = path.resolve(path.join(this.serviceDir, archiveName))
     this.pythonEnvDir = path.resolve(path.join(this.serviceDir, '.venv'))
     this.detectDevicesScript = path.resolve(path.join(this.serviceDir, 'detect_devices.py'))
+    // Records exactly which version/releaseTag was installed. Written at the end of
+    // set_up(), read by getInstalledVersion(). This is the only reliable source of
+    // the installed releaseTag (the `ovms --version` output does not report it).
+    this.versionMarkerPath = path.resolve(path.join(this.serviceDir, 'installed-version.json'))
 
     // Check if already set up
     this.isSetUp = this.serviceIsSetUp()
@@ -104,6 +168,636 @@ export class OpenVINOBackendService implements ApiService {
     return filesystem.existsSync(this.ovmsExePath)
   }
 
+  /**
+   * Return process.env with inherited Python/virtualenv variables removed.
+   * When AI Playground is launched from a shell with another venv active
+   * (e.g. ComfyUI's .venv), variables like VIRTUAL_ENV / PYTHONHOME /
+   * PYTHONPATH / __PYVENV_LAUNCHER__ leak into any Python we spawn and break it
+   * with "failed to get the Python codec of the filesystem encoding".
+   */
+  private stripInheritedPythonEnv(): {
+    cleanEnv: NodeJS.ProcessEnv
+    inheritedVirtualEnv?: string
+  } {
+    const {
+      VIRTUAL_ENV: inheritedVirtualEnv,
+      PYTHONPATH: _pythonPath,
+      PYTHONHOME: _pythonHome,
+      PYTHONSTARTUP: _pythonStartup,
+      PYTHONEXECUTABLE: _pythonExecutable,
+      __PYVENV_LAUNCHER__: _pyvenvLauncher,
+      ...cleanEnv
+    } = process.env
+    return { cleanEnv, inheritedVirtualEnv }
+  }
+
+  /**
+   * Drop any foreign virtualenv bin/Scripts directories from a PATH string so a
+   * spawned interpreter can't resolve `python`/`python3` to the wrong venv.
+   */
+  private sanitizeForeignVenvFromPath(pathStr: string | undefined, activeVenv?: string): string {
+    const venvBinDirs = new Set<string>()
+    if (activeVenv) {
+      venvBinDirs.add(path.normalize(path.join(activeVenv, 'bin')))
+      venvBinDirs.add(path.normalize(path.join(activeVenv, 'Scripts')))
+    }
+    const looksLikeVenvBin = (p: string) => /[\\/](?:\.venv|venv)[\\/](?:bin|Scripts)$/.test(p)
+    return (pathStr ?? '')
+      .split(path.delimiter)
+      .filter((p) => {
+        if (!p) return false
+        const normalized = path.normalize(p)
+        return !venvBinDirs.has(normalized) && !looksLikeVenvBin(normalized)
+      })
+      .join(path.delimiter)
+  }
+
+  /**
+   * Build the environment used to spawn the OVMS executable.
+   * Cross-platform: Windows resolves DLLs from PATH, Linux resolves shared
+   * objects (libopenvino, libtbb, Level Zero GPU libs, ...) from LD_LIBRARY_PATH.
+   *
+   * @param extraLibPaths - Additional directories to prepend to LD_LIBRARY_PATH
+   *   (Linux only). Used to supply libpython3.x paths discovered via ldconfig
+   *   when the package was not found via apt-cache.
+   */
+  private buildOvmsEnv(extraLibPaths: string[] = []): NodeJS.ProcessEnv {
+    // Set up environment variables as per setupvars.ps1 / setupvars.sh
+    const pythonDir = path.join(this.ovmsDir, 'python')
+    const scriptsDir = path.join(pythonDir, process.platform === 'win32' ? 'Scripts' : 'bin')
+
+    const { cleanEnv, inheritedVirtualEnv } = this.stripInheritedPythonEnv()
+    const sanitizedInheritedPath = this.sanitizeForeignVenvFromPath(
+      cleanEnv.PATH,
+      inheritedVirtualEnv,
+    )
+
+    if (process.platform === 'win32') {
+      // Windows ships a fully self-contained CPython under ovms/python, so we
+      // point PYTHONHOME at it and expose its Scripts dir on PATH.
+      return {
+        ...cleanEnv,
+        OVMS_DIR: this.ovmsDir,
+        PYTHONHOME: pythonDir,
+        PATH: [this.ovmsDir, pythonDir, scriptsDir, sanitizedInheritedPath]
+          .filter(Boolean)
+          .join(path.delimiter),
+      }
+    }
+
+    // Linux/macOS: the OVMS package does NOT bundle a complete CPython stdlib
+    // (that's why the .deb depends on `python3`) AND it is linked against a
+    // specific libpython soname (3.12 for the ubuntu24 build). On distros whose
+    // system Python differs (e.g. Ubuntu 26 → 3.14), pointing PYTHONHOME at the
+    // system Python is impossible/ABI-incompatible. Instead we provision a
+    // managed CPython 3.12 (via uv) that ships a matching libpython3.12.so.1.0
+    // AND a complete 3.12 stdlib, and point PYTHONHOME at it. Its lib dir is
+    // added to LD_LIBRARY_PATH (passed in via extraLibPaths) so the dynamic
+    // linker resolves libpython3.12 to the genuine, ABI-correct library.
+    // When no managed Python could be provisioned we leave PYTHONHOME unset and
+    // fall back to the system Python (works on Ubuntu 24).
+    const ovmsPythonModuleDirs = [
+      path.join(this.ovmsDir, 'lib', 'python'),
+      path.join(pythonDir, 'lib', 'python'),
+    ].filter((p) => filesystem.existsSync(p))
+
+    return {
+      ...cleanEnv,
+      OVMS_DIR: this.ovmsDir,
+      // Keep the inherited PATH (so /usr/bin/python3 is discoverable) and put
+      // the OVMS bin dir first for the ovms binary's own helper executables.
+      PATH: [path.join(this.ovmsDir, 'bin'), this.ovmsDir, sanitizedInheritedPath]
+        .filter(Boolean)
+        .join(path.delimiter),
+      // Point the embedded interpreter at the managed CPython 3.12 (complete
+      // stdlib + matching libpython) when available.
+      ...(this.ovmsEmbeddedPythonHome && { PYTHONHOME: this.ovmsEmbeddedPythonHome }),
+      ...(ovmsPythonModuleDirs.length > 0 && {
+        PYTHONPATH: ovmsPythonModuleDirs.join(path.delimiter),
+      }),
+      // Ensure a UTF-8 locale so the interpreter can load the filesystem-encoding
+      // codec on minimal setups where LANG/LC_ALL may be unset.
+      LANG: process.env.LANG ?? 'C.UTF-8',
+      LC_ALL: process.env.LC_ALL ?? process.env.LANG ?? 'C.UTF-8',
+      LD_LIBRARY_PATH: [
+        path.join(this.ovmsDir, 'lib'),
+        ...extraLibPaths,
+        process.env.LD_LIBRARY_PATH ?? '',
+      ]
+        .filter(Boolean)
+        .join(':'),
+    }
+  }
+
+  /**
+   * Resolve additional LD_LIBRARY_PATH directories needed by the OVMS binary on Linux,
+   * and create compatibility symlinks for any missing shared libraries.
+   *
+   * OVMS (ubuntu24 build) is linked against specific soname versions
+   * (e.g. libpython3.12.so.1.0, libxml2.so.2) that may not exist on newer distros
+   * (e.g. Ubuntu 26 ships Python 3.14 and may have bumped other sonames).
+   *
+   * Strategy:
+   *  1. Run `ldd` on the OVMS binary (with ovms/lib in LD_LIBRARY_PATH so bundled
+   *     libs are counted as satisfied).
+   *  2. Collect every library reported as "not found".
+   *  3. For each missing lib, search `ldconfig -p` for any version of the same
+   *     base library present on the system.
+   *  4. Create a symlink `ovms/lib/<missing-soname> → <system-library-path>`.
+   *     Since ovms/lib is already in LD_LIBRARY_PATH, the dynamic linker finds it.
+   *
+   * The result is cached after the first call.
+   */
+  /**
+   * Ensure jinja2 (and its MarkupSafe dependency) is available in the OVMS Python
+   * path. OVMS ubuntu24 builds use Python's jinja2 library to render chat templates;
+   * the OVMS package does not bundle it, so we install it on first use via uv.
+   */
+  private async ensureOvmsJinja2(): Promise<void> {
+    const ovmsLibPython = path.join(this.ovmsDir, 'lib', 'python')
+    const jinja2Marker = path.join(ovmsLibPython, 'jinja2')
+    if (filesystem.existsSync(jinja2Marker)) {
+      return
+    }
+    if (!filesystem.existsSync(ovmsLibPython)) {
+      filesystem.mkdirSync(ovmsLibPython, { recursive: true })
+    }
+    const pythonBin = this.ovmsEmbeddedPythonHome
+      ? path.join(this.ovmsEmbeddedPythonHome, 'bin', 'python3.12')
+      : undefined
+    this.appLogger.info(
+      `Installing jinja2 for OVMS chat template rendering into ${ovmsLibPython}`,
+      this.name,
+    )
+    try {
+      await uvPipInstallToTarget(['jinja2'], ovmsLibPython, pythonBin)
+      this.appLogger.info('jinja2 installed successfully for OVMS', this.name)
+    } catch (e) {
+      this.appLogger.warn(
+        `Failed to install jinja2 for OVMS: ${e}. Chat template rendering may not work.`,
+        this.name,
+      )
+    }
+  }
+
+  private async resolveOvmsExtraLibPaths(): Promise<string[]> {
+    if (this.cachedOvmsExtraLibPaths !== null) return this.cachedOvmsExtraLibPaths
+    if (process.platform === 'win32') {
+      this.cachedOvmsExtraLibPaths = []
+      return []
+    }
+
+    const extraLibPaths: string[] = []
+
+    // Provision a managed CPython 3.12 so OVMS gets the genuine libpython3.12 it
+    // is linked against (the host distro's Python may be incompatible, e.g.
+    // Ubuntu 26 ships 3.14 which lacks symbols OVMS imports). Its lib dir goes
+    // on LD_LIBRARY_PATH and its home becomes PYTHONHOME (see buildOvmsEnv).
+    const embeddedPython = await this.resolveOvmsEmbeddedPython()
+    if (embeddedPython) {
+      this.ovmsEmbeddedPythonHome = embeddedPython.home
+      extraLibPaths.push(embeddedPython.libDir)
+    }
+
+    // OVMS ubuntu24 builds use Python's jinja2 to render chat templates but do
+    // not bundle it. Install it into ovms/lib/python (already on PYTHONPATH).
+    await this.ensureOvmsJinja2()
+
+    // Create compat symlinks for any *other* libs still missing (e.g. libxml2),
+    // counting the managed-python lib dir as already-satisfied so we never
+    // recreate a bad cross-version libpython symlink.
+    await this.ensureOvmsMissingLibSymlinks(extraLibPaths)
+
+    this.cachedOvmsExtraLibPaths = extraLibPaths
+    return extraLibPaths
+  }
+
+  /**
+   * Ensure a managed CPython that matches the OVMS build's libpython soname is
+   * available and locate its home + shared-library directory.
+   *
+   * Returns null on non-Linux or if provisioning fails (caller then falls back
+   * to the host Python via ldconfig-based symlinks).
+   */
+  private async resolveOvmsEmbeddedPython(): Promise<{
+    home: string
+    libDir: string
+    libFile: string
+  } | null> {
+    if (process.platform === 'win32') return null
+    try {
+      const interpreterPath = await ensureManagedPython(
+        OpenVINOBackendService.OVMS_EMBEDDED_PYTHON_VERSION,
+      )
+      // Standalone layout: <home>/bin/python3.12 with stdlib in <home>/lib/python3.12
+      // and the shared lib in <home>/lib/libpython3.12.so.1.0
+      const home = path.dirname(path.dirname(interpreterPath))
+      const libDir = path.join(home, 'lib')
+      const libFile = ['libpython3.12.so.1.0', 'libpython3.12.so']
+        .map((name) => path.join(libDir, name))
+        .find((p) => filesystem.existsSync(p))
+
+      if (!libFile) {
+        this.appLogger.warn(
+          `Managed CPython 3.12 found at ${home} but no libpython in ${libDir}; ` +
+            'falling back to host Python',
+          this.name,
+        )
+        return null
+      }
+
+      this.appLogger.info(
+        `Using managed CPython 3.12 for OVMS — home: ${home}, libpython: ${libFile}`,
+        this.name,
+      )
+      return { home, libDir, libFile }
+    } catch (e) {
+      this.appLogger.warn(
+        `Failed to provision managed CPython 3.12 for OVMS (${e}); falling back to host Python`,
+        this.name,
+      )
+      return null
+    }
+  }
+
+  /**
+   * Run ldd on the OVMS binary and create compatibility symlinks in ovms/lib/ for
+   * every shared library that is "not found" on the current system.
+   *
+   * @param extraLibDirs - Additional directories (e.g. the managed CPython lib
+   *   dir) to add to LD_LIBRARY_PATH while probing, so libraries they provide are
+   *   counted as satisfied and not symlinked to an incompatible host version.
+   */
+  private async ensureOvmsMissingLibSymlinks(extraLibDirs: string[] = []): Promise<void> {
+    const ovmsLibDir = path.join(this.ovmsDir, 'lib')
+    await filesystem.ensureDir(ovmsLibDir)
+
+    // Remove stale compat symlinks created by earlier runs. Previous versions of
+    // this code created dangerous cross-ABI symlinks (e.g. libxml2.so.2 →
+    // /usr/lib/.../libxml2.so.16) that cause SIGSEGV. Our symlinks always use
+    // ABSOLUTE targets pointing to system libraries (e.g. /usr/lib/...), while
+    // OVMS-bundled symlinks use RELATIVE targets (e.g. libopenvino.so.2026.1.0).
+    // Only remove symlinks with absolute targets outside the ovms directory.
+    const existingLibs = await filesystem.readdir(ovmsLibDir).catch(() => [] as string[])
+    for (const entry of existingLibs) {
+      const full = path.join(ovmsLibDir, entry)
+      const isSymlink = await filesystem
+        .lstat(full)
+        .then((s) => s.isSymbolicLink())
+        .catch(() => false)
+      if (isSymlink) {
+        const target = await filesystem.readlink(full).catch(() => '')
+        // Our compat symlinks always point to absolute system paths (e.g.
+        // /usr/lib/x86_64-linux-gnu/libfoo.so). Bundled symlinks use relative
+        // targets (e.g. libopenvino.so.2026.1.0). Only remove absolute-target
+        // symlinks that point outside the ovms tree.
+        if (target && path.isAbsolute(target) && !target.startsWith(this.ovmsDir)) {
+          await filesystem.remove(full)
+          this.appLogger.info(`Removed stale compat symlink: ${entry} → ${target}`, this.name)
+        }
+      }
+    }
+
+    // Run ldd with ovms/lib (+ extra dirs) in LD_LIBRARY_PATH so already-bundled
+    // and managed-python libs count as satisfied. ldd exits with code 1 when any
+    // library is missing, so we capture output from the error object as well.
+    let lddOutput = ''
+    try {
+      const lddEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        LD_LIBRARY_PATH: [ovmsLibDir, ...extraLibDirs, process.env.LD_LIBRARY_PATH ?? '']
+          .filter(Boolean)
+          .join(':'),
+      }
+      lddOutput = await execAsync(`ldd "${this.ovmsExePath}"`, { env: lddEnv })
+        .then((r) => r.stdout)
+        .catch((e: { stdout?: string; stderr?: string }) => `${e.stdout ?? ''}${e.stderr ?? ''}`)
+    } catch {
+      this.appLogger.warn('ldd not available; skipping OVMS dependency symlink check', this.name)
+      return
+    }
+
+    // Parse lines like: "	libxml2.so.2 => not found"
+    const missingLibsSet = new Set<string>()
+    const notFoundRegex = /^\s*(\S+\.so\S*)\s+=>\s+not found/gm
+    let match: RegExpExecArray | null
+    while ((match = notFoundRegex.exec(lddOutput)) !== null) {
+      if (match[1]) missingLibsSet.add(match[1])
+    }
+    const missingLibs = [...missingLibsSet]
+
+    if (missingLibs.length === 0) {
+      this.appLogger.info('All OVMS dynamic library dependencies are satisfied', this.name)
+      return
+    }
+
+    this.appLogger.info(`OVMS missing libraries: ${missingLibs.join(', ')}`, this.name)
+
+    // Build a map of every library registered in the linker cache: soname → real path
+    let ldconfigOutput = ''
+    try {
+      const { stdout } = await execAsync('ldconfig -p')
+      ldconfigOutput = stdout
+    } catch {
+      this.appLogger.warn('ldconfig not available; cannot create compatibility symlinks', this.name)
+      return
+    }
+
+    const ldconfigMap = new Map<string, string>()
+    for (const line of ldconfigOutput.split('\n')) {
+      // Line format: "	libfoo.so.2 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libfoo.so.2"
+      const m = line.match(/^\s*(\S+)\s+\([^)]+\)\s+=>\s+(\S+)/)
+      if (m?.[1] && m?.[2]) ldconfigMap.set(m[1], m[2])
+    }
+
+    for (const missingLib of missingLibs) {
+      const symlinkPath = path.join(ovmsLibDir, missingLib)
+      if (filesystem.existsSync(symlinkPath)) continue
+
+      // First, check if the real library exists within ovms/lib itself (self-healing
+      // for bundled soname symlinks that may have been accidentally deleted by earlier
+      // versions of this code). E.g. libopenvino_genai.so.2610 → libopenvino_genai.so.2026.1.0.0
+      const bundledTarget = this.findBundledLibInOvmsDir(missingLib, ovmsLibDir)
+      if (bundledTarget) {
+        await this.createOvmsCompatSymlink(symlinkPath, bundledTarget)
+        continue
+      }
+
+      // Then check system libraries via ldconfig
+      const found = this.findCompatLibInLdconfig(missingLib, ldconfigMap)
+      if (found) {
+        if (found.isAbiRisky) {
+          this.appLogger.warn(
+            `Creating ABI-risky compat symlink for ${missingLib} → ${found.path} ` +
+              `(different soname version — may produce linker warnings but allows OVMS to start)`,
+            this.name,
+          )
+        }
+        await this.createOvmsCompatSymlink(symlinkPath, found.path)
+      } else {
+        this.appLogger.warn(
+          `No system library found for ${missingLib} — OVMS may fail to start`,
+          this.name,
+        )
+      }
+    }
+  }
+
+  /**
+   * Look for a bundled library file in ovms/lib that can satisfy a missing soname.
+   * This handles self-healing when internal soname symlinks were accidentally deleted.
+   *
+   * For example, if `libopenvino_genai.so.2610` is missing but
+   * `libopenvino_genai.so.2026.1.0.0` exists as a real file in ovms/lib,
+   * we return the path to the real file so a relative symlink can be recreated.
+   *
+   * Strategy: strip the soname suffix to get the base name (e.g. `libopenvino_genai`),
+   * then look for any file in ovms/lib that starts with `<base>.so` and is a real
+   * file (not a symlink), giving preference to longer version strings (more specific).
+   */
+  private findBundledLibInOvmsDir(missingLib: string, ovmsLibDir: string): string | undefined {
+    const libBase = missingLib.replace(/\.so\.\d[\d.]*$/, '')
+    const prefix = `${libBase}.so`
+
+    try {
+      const entries = filesystem.readdirSync(ovmsLibDir)
+      // Find real files (not symlinks) that match the base library name
+      const candidates = entries.filter((entry) => {
+        if (!entry.startsWith(prefix)) return false
+        if (entry === missingLib) return false // skip the missing one itself
+        const full = path.join(ovmsLibDir, entry)
+        try {
+          const stat = filesystem.lstatSync(full)
+          return stat.isFile() // real file, not a symlink
+        } catch {
+          return false
+        }
+      })
+
+      if (candidates.length === 0) return undefined
+
+      // Prefer the most specific version (longest filename)
+      candidates.sort((a, b) => b.length - a.length)
+      const target = candidates[0]
+      this.appLogger.info(
+        `Found bundled library for ${missingLib} in ovms/lib: ${target}`,
+        this.name,
+      )
+      // Return the filename only (relative target) for the symlink
+      return target
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Find a compatible real library path for a missing soname using three strategies:
+   *
+   *  1. Exact soname match in ldconfig (lib present but not in a searched dir).
+   *  2. Version embedded in base name — strip trailing .N segments until a match is
+   *     found, e.g. libpython3.12 → libpython3 → matches libpython3.14.so.1.0
+   *  3. (Last resort) Same base name, different soname version — e.g. libxml2.so.2 →
+   *     libxml2.so.16. This is ABI-risky (may cause "no version information" warnings)
+   *     but is better than OVMS failing to start entirely. The library may still work
+   *     if the consumer doesn't actually invoke the incompatible symbols at runtime.
+   */
+  private findCompatLibInLdconfig(
+    missingLib: string,
+    ldconfigMap: Map<string, string>,
+  ): { path: string; isAbiRisky: boolean } | undefined {
+    // Strip the soname suffix to get the base, e.g.:
+    //   libpython3.12.so.1.0 → libpython3.12
+    //   libxml2.so.2         → libxml2
+    const libBase = missingLib.replace(/\.so\.\d[\d.]*$/, '')
+
+    // 1. Exact match
+    const exact = ldconfigMap.get(missingLib)
+    if (exact && filesystem.existsSync(exact)) return { path: exact, isAbiRisky: false }
+
+    // 2. Version is part of the base name (e.g. libpython3.12 → libpython3 → libpython3.14)
+    //    Progressively strip trailing ".N" segments from the base until a match is found.
+    let shortenedBase = libBase
+    while (/\.\d+$/.test(shortenedBase)) {
+      shortenedBase = shortenedBase.replace(/\.\d+$/, '')
+      const versionedMatch = [...ldconfigMap.entries()].find(
+        ([name, realPath]) =>
+          // Must start with the shortened base followed by a version dot or ".so"
+          (name.startsWith(`${shortenedBase}.so.`) ||
+            name.match(new RegExp(`^${shortenedBase}\\.\\d`))) &&
+          filesystem.existsSync(realPath),
+      )
+      if (versionedMatch) return { path: versionedMatch[1], isAbiRisky: false }
+    }
+
+    // 3. Last resort: same base, different soname version (e.g. libxml2.so.16 for libxml2.so.2).
+    //    This crosses ABI boundaries and may produce linker warnings or runtime issues,
+    //    but it's better than OVMS refusing to start at all — many libraries (like
+    //    libazurestorage needing libxml2) may never actually be invoked at runtime for
+    //    local model inference.
+    const sameName = [...ldconfigMap.entries()].find(
+      ([name, realPath]) => name.startsWith(`${libBase}.so.`) && filesystem.existsSync(realPath),
+    )
+    if (sameName) return { path: sameName[1], isAbiRisky: true }
+
+    return undefined
+  }
+
+  private async createOvmsCompatSymlink(symlinkPath: string, targetPath: string): Promise<void> {
+    try {
+      await filesystem.symlink(targetPath, symlinkPath)
+      this.appLogger.info(
+        `Created compat symlink: ${path.basename(symlinkPath)} → ${targetPath}`,
+        this.name,
+      )
+    } catch (e) {
+      this.appLogger.warn(
+        `Failed to create compat symlink ${path.basename(symlinkPath)}: ${e}`,
+        this.name,
+      )
+    }
+  }
+
+  /**
+   * Build the environment used to spawn the OpenVINO Python device-detection venv.
+   * This venv (ovms-independent) has its own CPython, so we activate it via
+   * VIRTUAL_ENV and must likewise strip any inherited foreign-venv pollution,
+   * otherwise device detection crashes and silently hides the Intel GPU/NPU.
+   */
+  private buildPythonDetectionEnv(): NodeJS.ProcessEnv {
+    const { cleanEnv, inheritedVirtualEnv } = this.stripInheritedPythonEnv()
+    const venvBinDir = path.join(
+      this.pythonEnvDir,
+      process.platform === 'win32' ? 'Scripts' : 'bin',
+    )
+    const sanitizedInheritedPath = this.sanitizeForeignVenvFromPath(
+      cleanEnv.PATH,
+      inheritedVirtualEnv,
+    )
+
+    return {
+      ...cleanEnv,
+      // Activate our own detection venv (its bin dir is prepended so its python
+      // is the one that runs; PYTHONHOME stays unset so the venv resolves it).
+      VIRTUAL_ENV: this.pythonEnvDir,
+      PATH: [venvBinDir, sanitizedInheritedPath].filter(Boolean).join(path.delimiter),
+      // On Linux, the OpenVINO runtime needs the Level Zero loader & Intel GPU
+      // driver from the system lib dir to enumerate Intel GPUs/NPUs.
+      ...(process.platform !== 'win32' && {
+        LANG: process.env.LANG ?? 'C.UTF-8',
+        LC_ALL: process.env.LC_ALL ?? process.env.LANG ?? 'C.UTF-8',
+        LD_LIBRARY_PATH: ['/usr/lib/x86_64-linux-gnu', process.env.LD_LIBRARY_PATH ?? '']
+          .filter(Boolean)
+          .join(':'),
+      }),
+    }
+  }
+
+  private async ensureLinuxRuntimeDependencies(
+    onProgress?: (message: string) => Promise<void> | void,
+  ): Promise<void> {
+    if (process.platform !== 'linux') return
+
+    const hasApt = await hasAptGet()
+    if (!hasApt) {
+      this.appLogger.warn(
+        'apt-get not found; skipping automatic Linux dependency install',
+        this.name,
+      )
+      return
+    }
+
+    const distroAwarePackageList = await resolvePackageList(
+      this.linuxAlternativePackages,
+      this.linuxRuntimePackages,
+    )
+    const missingPackages = await getMissingPackages(distroAwarePackageList)
+
+    if (missingPackages.length === 0) {
+      this.appLogger.info(
+        'All OpenVINO Linux runtime dependencies are already installed',
+        this.name,
+      )
+      return
+    }
+
+    const packageList = missingPackages.map((p) => `- ${p}`).join('\n')
+    const { response } = await dialog.showMessageBox(this.win, {
+      type: 'warning',
+      buttons: ['Install now', 'Cancel setup'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Install OpenVINO Linux dependencies',
+      message: 'OpenVINO requires additional Ubuntu packages before setup can continue.',
+      detail:
+        `Missing packages:\n${packageList}\n\n` +
+        'AI Playground will request administrator permission and install these packages automatically.',
+    })
+
+    if (response === 1) {
+      throw new Error('OpenVINO setup canceled: Linux dependencies were not installed')
+    }
+
+    await onProgress?.('installing Ubuntu dependencies for OpenVINO')
+
+    const pkexecAvailable = await hasPkexec()
+    if (pkexecAvailable) {
+      const installResult = await runPkexecInstall(missingPackages, 'apt-get update')
+      if (!installResult.success) {
+        const aptMissing = parseAptMissingPackages(installResult.output)
+        if (aptMissing.length > 0) {
+          this.appLogger.error(
+            `OpenVINO dependency install failed. Missing in apt repo: ${aptMissing.join(', ')}`,
+            this.name,
+          )
+        } else {
+          this.appLogger.error(
+            `OpenVINO dependency install failed with output: ${installResult.output}`,
+            this.name,
+          )
+        }
+      }
+    } else {
+      await onProgress?.('pkexec unavailable, falling back to terminal installer')
+      const terminalExited = await waitForTerminalInstall(missingPackages, 'sudo apt-get update')
+      if (!terminalExited) {
+        throw new Error(
+          `Could not open installer automatically. Please install: ${missingPackages.join(', ')}`,
+        )
+      }
+      this.appLogger.info('Terminal closed. Waiting for apt-cache refresh...', this.name)
+      await new Promise((resolve) => setTimeout(resolve, 3000))
+    }
+
+    let stillMissing: string[] = []
+    for (let retryAttempt = 0; retryAttempt < 5; retryAttempt++) {
+      stillMissing = await getMissingPackages(distroAwarePackageList)
+      if (stillMissing.length === 0) {
+        this.appLogger.info('Installed missing Linux runtime dependencies for OpenVINO', this.name)
+        return
+      }
+      if (retryAttempt < 4) {
+        this.appLogger.info(
+          `Still missing on attempt ${retryAttempt + 1}: ${stillMissing.join(', ')}. Retrying...`,
+          this.name,
+        )
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
+    }
+
+    this.appLogger.error(
+      `OpenVINO dependencies still missing after installer: ${stillMissing.join(', ')}`,
+      this.name,
+    )
+
+    throw new Error(`Dependencies still missing after installer: ${stillMissing.join(', ')}`)
+  }
+
+  private async ensureLinuxRuntimeDependenciesForStartup(): Promise<void> {
+    await this.ensureLinuxRuntimeDependencies((message) => {
+      this.appLogger.info(message, this.name)
+    })
+  }
+
   async ensureBackendReadiness(
     llmModelName: string,
     embeddingModelName?: string,
@@ -115,6 +809,10 @@ export class OpenVINOBackendService implements ApiService {
     )
 
     try {
+      if (process.platform === 'linux') {
+        await this.ensureLinuxRuntimeDependenciesForStartup()
+      }
+
       // Handle LLM model
       const needsLlmRestart =
         this.currentModel !== llmModelName ||
@@ -188,7 +886,8 @@ export class OpenVINOBackendService implements ApiService {
       // Try Python-based detection first (provides full device names)
       const pythonDevices = await this.detectDevicesWithPython()
       if (pythonDevices) {
-        this.applyDetectedDevices(pythonDevices)
+        await this.applyDetectedDevices(pythonDevices)
+        await this.warnIfNpuSiliconMissingDriver(pythonDevices)
         this.updateStatus()
         return
       }
@@ -202,7 +901,8 @@ export class OpenVINOBackendService implements ApiService {
     // Fallback to OVMS-based detection
     try {
       const ovmsDevices = await this.detectDevicesWithOvms()
-      this.applyDetectedDevices(ovmsDevices)
+      await this.applyDetectedDevices(ovmsDevices)
+      await this.warnIfNpuSiliconMissingDriver(ovmsDevices)
     } catch (error) {
       this.appLogger.error(`Failed to detect devices: ${error}`, this.name)
       // Fallback to default device on error
@@ -210,6 +910,44 @@ export class OpenVINOBackendService implements ApiService {
       this.sttDevices = [...defaultDevices]
     }
     this.updateStatus()
+  }
+
+  /**
+   * Linux-only: surface a warning when an Intel NPU is on the PCI bus
+   * (lspci class 1200, vendor 8086) but OpenVINO did not enumerate it.
+   * This happens when the kernel module `intel_vpu` is loaded (so /dev/accel/accel0
+   * exists) but the userspace stack from intel/linux-npu-driver is not installed.
+   * The Intel GPU APT repo does NOT carry these packages — they only ship as a
+   * release tarball on GitHub.
+   */
+  private async warnIfNpuSiliconMissingDriver(
+    devices: { id: string; name: string }[],
+  ): Promise<void> {
+    if (process.platform !== 'linux') return
+    if (devices.some((d) => d.id === 'NPU' || d.id.startsWith('NPU.'))) return
+    try {
+      // PCI class 1200 = Processing accelerators. NPU silicon is exposed there.
+      // Timeout matches the codebase pattern (other execAsync calls use timeout: 5000);
+      // 2s is plenty for `lspci` which reads from sysfs.
+      const { stdout } = await execAsync('lspci -nn -d 8086:', { timeout: 2000 })
+      const hasNpuOnBus = /Processing accelerators \[1200\]/.test(stdout)
+      if (!hasNpuOnBus) return
+      this.appLogger.warn(
+        'Intel NPU detected on PCI bus but not enumerated by OpenVINO. ' +
+          'Install the NPU userspace driver from ' +
+          'https://github.com/intel/linux-npu-driver/releases ' +
+          '(packages: intel-driver-compiler-npu, intel-fw-npu, intel-level-zero-npu). ',
+        this.name,
+        true,
+      )
+    } catch (error) {
+      // Best-effort probe. Log so real failures (missing binary, permissions,
+      // process killed by timeout) are diagnosable instead of silently swallowed.
+      this.appLogger.warn(
+        `NPU PCI probe skipped (lspci unavailable, timed out, or failed): ${error}`,
+        this.name,
+      )
+    }
   }
 
   /**
@@ -234,11 +972,7 @@ export class OpenVINOBackendService implements ApiService {
       const childProcess = spawn(pythonExe, [this.detectDevicesScript], {
         cwd: this.serviceDir,
         windowsHide: true,
-        env: {
-          ...process.env,
-          VIRTUAL_ENV: this.pythonEnvDir,
-          PATH: `${path.join(this.pythonEnvDir, 'Scripts')};${path.join(this.pythonEnvDir, 'bin')};${process.env.PATH}`,
-        },
+        env: this.buildPythonDetectionEnv(),
       })
 
       let stdout = ''
@@ -301,6 +1035,7 @@ export class OpenVINOBackendService implements ApiService {
 
     // Get a temporary port for device detection
     const tempPort = await getPort({ port: portNumbers(57300, 57399) })
+    const extraLibPaths = await this.resolveOvmsExtraLibPaths()
 
     const detectedDeviceIds = await new Promise<string[]>((resolve, reject) => {
       const args = ['--config_path', '.', '--rest_port', tempPort.toString()]
@@ -310,19 +1045,10 @@ export class OpenVINOBackendService implements ApiService {
         this.name,
       )
 
-      // Set up environment variables as per setupvars.ps1
-      const pythonDir = path.join(this.ovmsDir, 'python')
-      const scriptsDir = path.join(this.ovmsDir, 'python', 'Scripts')
-
       const childProcess = spawn(this.ovmsExePath, args, {
         cwd: this.ovmsDir,
         windowsHide: true,
-        env: {
-          ...process.env,
-          OVMS_DIR: this.ovmsDir,
-          PYTHONHOME: pythonDir,
-          PATH: `${this.ovmsDir};${pythonDir};${scriptsDir};${process.env.PATH}`,
-        },
+        env: this.buildOvmsEnv(extraLibPaths),
       })
 
       let resolved = false
@@ -399,7 +1125,7 @@ export class OpenVINOBackendService implements ApiService {
   /**
    * Apply detected devices to the service state.
    */
-  private applyDetectedDevices(devices: { id: string; name: string }[]): void {
+  private async applyDetectedDevices(devices: { id: string; name: string }[]): Promise<void> {
     const mappedDevices: InferenceDevice[] = devices.map((device) => ({
       id: device.id,
       name: device.name,
@@ -412,16 +1138,22 @@ export class OpenVINOBackendService implements ApiService {
       ...mappedDevices,
     ]
 
-    // Helper function to select device by priority
+    // Helper function to select device, preferring a previously persisted id so
+    // the user's choice survives restart, then falling back to priority > AUTO.
     const selectByPriority = (
       deviceList: InferenceDevice[],
       priority: string[],
+      persistedId?: string,
     ): InferenceDevice[] => {
       const result = deviceList.map((d) => ({ ...d, selected: false }))
+      const persistedDevice =
+        persistedId !== undefined ? result.find((d) => d.id === persistedId) : undefined
       // Match by id prefix (e.g., 'GPU' matches 'GPU.0', 'GPU.1', etc.)
-      const selectedDevice = priority
-        .map((id) => result.find((d) => d.id === id || d.id.startsWith(`${id}.`)))
-        .find((d) => d !== undefined)
+      const selectedDevice =
+        persistedDevice ??
+        priority
+          .map((id) => result.find((d) => d.id === id || d.id.startsWith(`${id}.`)))
+          .find((d) => d !== undefined)
       if (selectedDevice) {
         selectedDevice.selected = true
       } else {
@@ -430,13 +1162,27 @@ export class OpenVINOBackendService implements ApiService {
       return result
     }
 
-    // LLM devices: priority GPU > AUTO
-    this.devices = selectByPriority(baseDevices, ['GPU'])
+    // LLM devices: persisted > best physical device (dGPU > iGPU > NPU > CPU) > AUTO.
+    // On first run this auto-selects and persists the best device as the user's
+    // choice; selectByPriority then simply honors that persisted id.
+    const bestLlmId = await resolveDefaultDevice(
+      mappedDevices,
+      this.settings.lastSelectedDevicePerBackend,
+      this.name,
+      this.settings.preferredDevice,
+      this.settings.lastSelectedDeviceUuidPerBackend,
+    )
+    this.devices = selectByPriority(
+      baseDevices,
+      bestLlmId ? [bestLlmId] : ['GPU'],
+      this.settings.lastSelectedDevicePerBackend[this.name],
+    )
 
-    // STT devices: priority NPU > CPU > GPU > AUTO
+    // STT devices: persisted > priority NPU > CPU > GPU > AUTO
     this.sttDevices = selectByPriority(
       baseDevices.map((d) => ({ ...d })),
       ['NPU', 'CPU', 'GPU'],
+      this.settings.lastSelectedDevicePerBackend[`${this.name}:stt`],
     )
 
     this.appLogger.info(
@@ -488,13 +1234,72 @@ export class OpenVINOBackendService implements ApiService {
       this.version = settings.version
       this.appLogger.info(`applied new OpenVINO Model Server version ${this.version}`, this.name)
     }
+    if (typeof settings.ovmsKvCachePrecision === 'string') {
+      const next = settings.ovmsKvCachePrecision
+      if (next !== this.kvCachePrecision) {
+        this.kvCachePrecision = next
+        this.appLogger.info(
+          `applied new OVMS kv_cache_precision: '${this.kvCachePrecision || '(default)'}'`,
+          this.name,
+        )
+        // The precision is baked into the LLM server's launch args, so an already
+        // running chat server keeps the old value. Tear down the chat sub-servers
+        // (LLM + embedding) so the next inference reloads with the new precision.
+        if (this.ovmsLlmProcess) {
+          await this.stopChatServers()
+        }
+      }
+    }
+  }
+
+  /**
+   * Persist exactly which version/releaseTag was installed. Called at the end of
+   * set_up() where this.version/this.releaseTag hold the values that were just
+   * downloaded. This is the authoritative source for getInstalledVersion() — it
+   * also captures the releaseTag, which `ovms --version` cannot report.
+   */
+  private async writeVersionMarker(): Promise<void> {
+    try {
+      await filesystem.writeJson(this.versionMarkerPath, {
+        version: this.version,
+        ...(this.releaseTag && { releaseTag: this.releaseTag }),
+      })
+    } catch (e) {
+      this.appLogger.warn(`Failed to write OpenVINO version marker: ${e}`, this.name)
+    }
   }
 
   async getInstalledVersion(): Promise<{ version?: string; releaseTag?: string } | undefined> {
     if (!this.isSetUp) return undefined
+
+    // Prefer the marker written at install time: it is fast, reliable (no binary
+    // execution) and the only source that knows the installed releaseTag.
+    if (filesystem.existsSync(this.versionMarkerPath)) {
+      try {
+        const marker = (await filesystem.readJson(this.versionMarkerPath)) as {
+          version?: string
+          releaseTag?: string
+        }
+        if (marker && marker.version) {
+          return {
+            version: marker.version,
+            ...(marker.releaseTag && { releaseTag: marker.releaseTag }),
+          }
+        }
+      } catch (e) {
+        this.appLogger.warn(`Failed to read OpenVINO version marker: ${e}`, this.name)
+      }
+    }
+
+    // Fallback for installations that predate the marker: ask the binary itself.
+    // Must use buildOvmsEnv() (PATH/PYTHONHOME on Windows, LD_LIBRARY_PATH on
+    // Linux) so the executable can resolve its DLLs/shared objects — otherwise
+    // the call fails intermittently and the version never shows.
     try {
+      const extraLibPaths = await this.resolveOvmsExtraLibPaths()
       const result = await execAsync(`"${this.ovmsExePath}" --version`, {
         timeout: 5000,
+        env: this.buildOvmsEnv(extraLibPaths),
       })
       // Parse output like "OpenVINO backend 2025.4.0.0rc3"
       const versionMatch = result.stdout.match(/OpenVINO backend\s+([\d.]+(?:rc\d+)?)/)
@@ -528,6 +1333,12 @@ export class OpenVINOBackendService implements ApiService {
   }
 
   async *set_up(): AsyncIterable<SetupProgress> {
+    // Stop any running model servers first. On a reinstall/update they hold
+    // ovms.exe and its DLLs open, which makes removeSync() of the ovms directory
+    // fail with EPERM on Windows. Done before setStatus('installing') so the
+    // teardown's own status changes don't clobber the installing state.
+    await this.stopAllModelServers()
+
     this.setStatus('installing')
     this.appLogger.info('setting up service', this.name)
 
@@ -545,6 +1356,26 @@ export class OpenVINOBackendService implements ApiService {
       // Create service directory if it doesn't exist
       if (!filesystem.existsSync(this.serviceDir)) {
         filesystem.mkdirSync(this.serviceDir, { recursive: true })
+      }
+
+      currentStep = 'download'
+      if (process.platform === 'linux') {
+        currentStep = 'linux dependencies'
+        yield {
+          serviceName: this.name,
+          step: currentStep,
+          status: 'executing',
+          debugMessage: 'checking and installing Ubuntu runtime dependencies for OpenVINO',
+        }
+
+        await this.ensureLinuxRuntimeDependencies()
+
+        yield {
+          serviceName: this.name,
+          step: currentStep,
+          status: 'executing',
+          debugMessage: 'linux dependency check complete',
+        }
       }
 
       currentStep = 'download'
@@ -610,6 +1441,7 @@ export class OpenVINOBackendService implements ApiService {
       }
 
       this.isSetUp = true
+      await this.writeVersionMarker()
       await this.updateCachedVersion()
       this.setStatus('notYetStarted')
 
@@ -637,10 +1469,82 @@ export class OpenVINOBackendService implements ApiService {
   }
 
   private async downloadOvms(): Promise<void> {
-    const baseUrl =
+    // The version is normally applied via updateSettings() before set_up(); if it
+    // is still unset the shipped backend-versions.json could not be read.
+    if (!this.version) {
+      throw new Error(
+        'OpenVINO Model Server version is not set (failed to read backend-versions.json)',
+      )
+    }
+    // Build an ordered list of candidate URLs to try, most-specific first.
+    //
+    // Windows – uses the OpenVINO toolkit storage (zip, no version in filename).
+    // Linux   – GitHub Releases are canonical; toolkit storage is a fallback.
+    //   GitHub/storage asset names embed the full version, e.g.:
+    //     ovms_ubuntu24_2026.1.0_python_on.tar.gz
+    //   On Ubuntu 26+ we try ubuntu26 builds first, falling back to ubuntu24.
+    const candidates: string[] = []
+    const storageBaseUrl =
       'https://storage.openvinotoolkit.org/repositories/openvino_model_server/packages'
-    const versionPath = this.releaseTag ? `weekly/${this.version}.${this.releaseTag}` : this.version
-    const downloadUrl = `${baseUrl}/${versionPath}/ovms_windows_python_on.zip`
+
+    if (process.platform === 'win32') {
+      const versionPath = this.releaseTag
+        ? `weekly/${this.version}.${this.releaseTag}`
+        : this.version
+      // The Windows package embeds the full version in its filename, e.g.
+      //   ovms_windows_2026.2.1_python_on.zip
+      candidates.push(`${storageBaseUrl}/${versionPath}/ovms_windows_${this.version}_python_on.zip`)
+      // Fallback to the legacy non-versioned name for older storage layouts.
+      candidates.push(`${storageBaseUrl}/${versionPath}/ovms_windows_python_on.zip`)
+    } else {
+      // Detect the host Ubuntu version to pick the best OVMS build.
+      // Try the exact distro match first, then fall back to older builds.
+      const distros = await this.getOvmsDistroTargets()
+      this.appLogger.info(
+        `OVMS distro download targets (in priority order): ${distros.join(', ')}`,
+        this.name,
+      )
+
+      for (const distro of distros) {
+        const pkg = `ovms_${distro}_${this.version}_python_on.tar.gz`
+
+        // 1. GitHub Releases (most reliable for versioned packages)
+        candidates.push(
+          `https://github.com/openvinotoolkit/model_server/releases/download/v${this.version}/${pkg}`,
+        )
+        // 2. OpenVINO toolkit storage – weekly build
+        if (this.releaseTag) {
+          candidates.push(`${storageBaseUrl}/weekly/${this.version}.${this.releaseTag}/${pkg}`)
+        }
+        // 3. OpenVINO toolkit storage – stable
+        candidates.push(`${storageBaseUrl}/${this.version}/${pkg}`)
+      }
+    }
+
+    let response: Awaited<ReturnType<typeof net.fetch>> | undefined
+    let downloadUrl = ''
+    for (const url of candidates) {
+      this.appLogger.info(`Trying OVMS download URL: ${url}`, this.name)
+      const res = await net.fetch(url)
+      const contentType = res.headers.get('content-type') ?? ''
+      // Reject HTML responses (they indicate a 404/index page, not a real archive)
+      if (res.ok && res.status === 200 && res.body && !contentType.includes('text/html')) {
+        response = res
+        downloadUrl = url
+        break
+      }
+      this.appLogger.info(
+        `URL ${url} returned ${res.status} / content-type: ${contentType} — skipping`,
+        this.name,
+      )
+    }
+
+    if (!response || !response.body) {
+      throw new Error(
+        `Failed to download OVMS: no valid download URL found. Tried: ${candidates.join(', ')}`,
+      )
+    }
+
     this.appLogger.info(`Downloading OVMS from ${downloadUrl}`, this.name)
 
     // Delete existing zip if it exists
@@ -649,16 +1553,115 @@ export class OpenVINOBackendService implements ApiService {
       filesystem.removeSync(this.zipPath)
     }
 
-    // Using electron net for better proxy support
-    const response = await net.fetch(downloadUrl)
-    if (!response.ok || response.status !== 200 || !response.body) {
-      throw new Error(`Failed to download OVMS: ${response.statusText}`)
-    }
-
     const buffer = await response.arrayBuffer()
     await filesystem.writeFile(this.zipPath, Buffer.from(buffer))
 
     this.appLogger.info(`OVMS zip file downloaded successfully`, this.name)
+  }
+
+  /**
+   * Determine the ordered list of OVMS distro build targets to try downloading.
+   *
+   * Reads /etc/os-release to detect the host Ubuntu version and returns targets
+   * in priority order — exact match first, then older compatible builds as fallback.
+   *
+   * For example, on Ubuntu 26.04 this returns ['ubuntu26', 'ubuntu24'] so we try
+   * the native build first and fall back to the Ubuntu 24 build if unavailable.
+   */
+  private async getOvmsDistroTargets(): Promise<string[]> {
+    try {
+      const osRelease = await filesystem.readFile('/etc/os-release', 'utf-8')
+      const versionIdMatch = osRelease.match(/^VERSION_ID="?(\d+)(?:\.\d+)?"?/m)
+      if (versionIdMatch?.[1]) {
+        const majorVersion = parseInt(versionIdMatch[1], 10)
+        this.appLogger.info(`Detected Ubuntu version: ${majorVersion}`, this.name)
+
+        if (majorVersion >= 26) {
+          // Try native ubuntu26 build first, fall back to ubuntu24
+          return ['ubuntu26', 'ubuntu24']
+        }
+        if (majorVersion >= 24) {
+          return ['ubuntu24']
+        }
+        // Older Ubuntu — try ubuntu24 anyway (best effort)
+        return ['ubuntu24']
+      }
+    } catch (e) {
+      this.appLogger.warn(`Failed to detect Ubuntu version from /etc/os-release: ${e}`, this.name)
+    }
+
+    // Fallback: just try ubuntu24
+    return ['ubuntu24']
+  }
+
+  /**
+   * Windows-only: forcibly kill every ovms.exe and its child tree, by image name.
+   *
+   * The tracked model-server processes are stopped via stopAllModelServers(), but
+   * other ovms.exe instances can still hold the install directory open — most
+   * notably the short-lived `ovms --version` probe (whose worker/python children
+   * leak because exec()'s timeout only signals the direct PID on Windows), or a
+   * process left over from a previous app run. Any one of them keeps a handle on
+   * the binary/DLLs (and ovms runs with cwd = the install dir), which makes the
+   * directory undeletable with EBUSY/EPERM. `taskkill /T /F` clears them all.
+   */
+  private async killStrayOvmsProcessesWindows(): Promise<void> {
+    if (process.platform !== 'win32') return
+    try {
+      await execAsync('taskkill /F /IM ovms.exe /T')
+      this.appLogger.info('Killed stray ovms.exe processes before extraction', this.name)
+    } catch (e) {
+      // Exits non-zero when no ovms.exe is running — expected and not fatal.
+      this.appLogger.info(`No stray ovms.exe to kill (or taskkill reported: ${e})`, this.name)
+    }
+  }
+
+  /**
+   * Remove a directory, retrying on transient failures. Even after the processes
+   * holding it have been killed, the OS can take a short while to release file
+   * handles on the ovms binary/DLLs (Windows EPERM/EBUSY), so the first removal
+   * may still fail. On Linux a read-only directory in the tree fails with EACCES;
+   * we restore write permissions before retrying. Retry a few times with a
+   * backoff, then surface a clear, actionable error.
+   */
+  private async removeDirWithRetry(dir: string, attempts = 5): Promise<void> {
+    // Pre-emptively restore write permissions on Linux/macOS so the very first
+    // removal of a read-only tree (e.g. a prior OVMS install) succeeds.
+    await restoreTreeWritePermissions(dir)
+
+    let lastError: unknown
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await filesystem.remove(dir)
+        return
+      } catch (e) {
+        lastError = e
+        const code = (e as NodeJS.ErrnoException)?.code
+        if (
+          (code === 'EPERM' || code === 'EBUSY' || code === 'ENOTEMPTY' || code === 'EACCES') &&
+          attempt < attempts
+        ) {
+          this.appLogger.warn(
+            `Removal of ${dir} failed with ${code} (attempt ${attempt}/${attempts}), retrying...`,
+            this.name,
+          )
+          // EACCES means a directory in the tree lost its write bit; re-assert
+          // permissions before the next attempt.
+          if (code === 'EACCES') {
+            await restoreTreeWritePermissions(dir)
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+          continue
+        }
+        break
+      }
+    }
+    throw new Error(
+      `Failed to remove existing OpenVINO directory ${dir} for reinstall. ` +
+        `Close any program holding files there (a running OpenVINO Model Server, ` +
+        `an antivirus scan, an IDE indexing the folder, or a terminal/Explorer ` +
+        `window inside it) and try again. Cause: ${lastError}`,
+    )
   }
 
   private async extractOvms(): Promise<void> {
@@ -667,16 +1670,19 @@ export class OpenVINOBackendService implements ApiService {
     // Delete existing ovms directory if it exists
     if (filesystem.existsSync(this.ovmsDir)) {
       this.appLogger.info(`Removing existing OVMS directory`, this.name)
-      filesystem.removeSync(this.ovmsDir)
+      // Kill any process still holding the binary/DLLs open first, otherwise the
+      // removal fails with EBUSY/EPERM on Windows.
+      await this.killStrayOvmsProcessesWindows()
+      await this.removeDirWithRetry(this.ovmsDir)
     }
 
     // Create ovms directory
     filesystem.mkdirSync(this.ovmsDir, { recursive: true })
 
-    // Extract zip file using PowerShell's Expand-Archive
+    // Extract archive using the cross-platform extract helper
+    // (PowerShell Expand-Archive on Windows, `tar -xf` on Linux/macOS).
     try {
-      const command = `powershell -Command "Expand-Archive -Path '${this.zipPath}' -DestinationPath '${this.ovmsDir}' -Force"`
-      await execAsync(command)
+      await extract(this.zipPath, this.ovmsDir)
 
       this.appLogger.info(`OVMS extracted successfully`, this.name)
 
@@ -705,6 +1711,13 @@ export class OpenVINOBackendService implements ApiService {
           this.appLogger.info(`Moved contents of '${items[0]}' up to ovms directory`, this.name)
         }
       }
+
+      // On Linux the tar.gz may not preserve the executable bit on the binary.
+      // Done after the folder-flattening above so ovmsExePath resolves correctly.
+      if (process.platform !== 'win32' && filesystem.existsSync(this.ovmsExePath)) {
+        await filesystem.chmod(this.ovmsExePath, 0o755)
+        this.appLogger.info(`Made ovms binary executable`, this.name)
+      }
     } catch (error) {
       this.appLogger.error(`Failed to extract OVMS: ${error}`, this.name)
       throw error
@@ -732,6 +1745,27 @@ export class OpenVINOBackendService implements ApiService {
     return 'running'
   }
 
+  /**
+   * Tear down every running OVMS model server. Each stop is isolated so one
+   * failure cannot leave the others running (and their files locked).
+   */
+  private async stopAllModelServers(): Promise<void> {
+    const stoppers: Array<[string, () => Promise<void>]> = [
+      ['llm', () => this.stopOvmsLlmServer()],
+      ['embedding', () => this.stopOvmsEmbeddingServer()],
+      ['transcription', () => this.stopOvmsTranscriptionServer()],
+      ['speech', () => this.stopOvmsSpeechServer()],
+      ['image', () => this.stopOvmsImageServer()],
+    ]
+    for (const [label, stopFn] of stoppers) {
+      try {
+        await stopFn()
+      } catch (e) {
+        this.appLogger.warn(`Failed to stop OVMS ${label} server: ${e}`, this.name)
+      }
+    }
+  }
+
   async stop(): Promise<BackendStatus> {
     this.appLogger.info(
       `Stopping backend ${this.name}. It was in state ${this.currentStatus}`,
@@ -740,13 +1774,35 @@ export class OpenVINOBackendService implements ApiService {
     this.desiredStatus = 'stopped'
     this.setStatus('stopping')
 
-    // Stop all model servers
-    await this.stopOvmsLlmServer()
-    await this.stopOvmsEmbeddingServer()
-    await this.stopOvmsTranscriptionServer()
+    await this.stopAllModelServers()
 
     this.setStatus('stopped')
     return 'stopped'
+  }
+
+  /**
+   * Start (or reuse) ONLY the embedding server, without touching the LLM server.
+   * Used by Cloud Mode RAG: the chat LLM is remote, but embeddings must run on a
+   * local server. Mirrors the embedding branch of ensureBackendReadiness.
+   */
+  async ensureEmbeddingServerReady(embeddingModelName: string): Promise<void> {
+    if (process.platform === 'linux') {
+      await this.ensureLinuxRuntimeDependenciesForStartup()
+    }
+
+    const needsEmbeddingRestart =
+      this.currentEmbeddingModel !== embeddingModelName || !this.ovmsEmbeddingProcess?.isReady
+
+    if (needsEmbeddingRestart) {
+      await this.stopOvmsEmbeddingServer()
+      await this.startOvmsEmbeddingServer(embeddingModelName)
+      this.appLogger.info(`Embedding server ready with model: ${embeddingModelName}`, this.name)
+    } else {
+      this.appLogger.info(
+        `Embedding server already running with model: ${embeddingModelName}`,
+        this.name,
+      )
+    }
   }
 
   /**
@@ -777,6 +1833,10 @@ export class OpenVINOBackendService implements ApiService {
    */
   async startTranscriptionServer(modelName: string): Promise<void> {
     try {
+      if (process.platform === 'linux') {
+        await this.ensureLinuxRuntimeDependenciesForStartup()
+      }
+
       this.appLogger.info(`Starting transcription server for model: ${modelName}`, this.name)
 
       // Check if already running with the same model
@@ -822,6 +1882,187 @@ export class OpenVINOBackendService implements ApiService {
     }
   }
 
+  /**
+   * Get the text-to-speech server URL if a speech server is running
+   * @returns The speech server base URL, or null if no speech server is running
+   */
+  getSpeechServerUrl(): string | null {
+    if (this.ovmsSpeechProcess?.isReady) {
+      return `http://127.0.0.1:${this.ovmsSpeechProcess.port}/v3`
+    }
+    return null
+  }
+
+  /**
+   * Start text-to-speech server independently
+   * @param modelName - The TTS model name (e.g., 'microsoft/speecht5_tts')
+   */
+  async startSpeechServer(modelName: string): Promise<void> {
+    try {
+      this.appLogger.info(`Starting speech server for model: ${modelName}`, this.name)
+
+      // Check if already running with the same model
+      if (this.ovmsSpeechProcess?.isReady && this.currentSpeechModel === modelName) {
+        this.appLogger.info(`Speech server already running with model: ${modelName}`, this.name)
+        return
+      }
+
+      // Stop existing server if running different model
+      if (this.ovmsSpeechProcess) {
+        await this.stopOvmsSpeechServer()
+      }
+
+      // Start new server
+      await this.startOvmsSpeechServer(modelName)
+      this.appLogger.info(`Speech server started successfully for model: ${modelName}`, this.name)
+    } catch (error) {
+      this.appLogger.error(
+        `Failed to start speech server for model ${modelName}: ${error}`,
+        this.name,
+      )
+      throw error
+    }
+  }
+
+  /**
+   * Stop text-to-speech server independently
+   */
+  async stopSpeechServer(): Promise<void> {
+    try {
+      this.appLogger.info('Stopping speech server', this.name)
+      await this.stopOvmsSpeechServer()
+      this.appLogger.info('Speech server stopped successfully', this.name)
+    } catch (error) {
+      this.appLogger.error(`Failed to stop speech server: ${error}`, this.name)
+      throw error
+    }
+  }
+
+  /**
+   * Get the image generation server URL if an image server is running
+   */
+  getImageServerUrl(): string | null {
+    if (this.ovmsImageProcess?.isReady) {
+      return `http://127.0.0.1:${this.ovmsImageProcess.port}/v3`
+    }
+    return null
+  }
+
+  /**
+   * Start image generation server, optionally stopping the LLM server first to free GPU memory.
+   * @param modelName - HuggingFace repo id (e.g. 'OpenVINO/LCM_Dreamshaper_v7-int8-ov')
+   * @param keepModelsLoaded - If true, don't stop the LLM server before starting image server
+   * @param resolution - Optional resolution in WxH format (e.g. '512x512'). When the selected
+   *   device is NPU the pipeline must be reshaped to a static shape, so this value is required
+   *   for NPU and is passed via OVMS `--resolution`. Ignored on non-NPU devices.
+   */
+  async startImageServer(
+    modelName: string,
+    keepModelsLoaded?: boolean,
+    resolution?: string,
+  ): Promise<void> {
+    try {
+      if (process.platform === 'linux') {
+        await this.ensureLinuxRuntimeDependenciesForStartup()
+      }
+
+      const selectedDevice = this.devices.find((d) => d.selected)?.id || 'AUTO'
+      const isNpu = selectedDevice.startsWith('NPU')
+      // Resolution only matters for NPU; ignore it on other devices so the model server
+      // keeps a dynamic pipeline and accepts whatever resolution the client asks for.
+      const effectiveResolution = isNpu ? resolution : undefined
+
+      this.appLogger.info(
+        `Starting image server for model: ${modelName}` +
+          (effectiveResolution ? ` (NPU resolution: ${effectiveResolution})` : ''),
+        this.name,
+      )
+
+      if (
+        this.ovmsImageProcess?.isReady &&
+        this.currentImageModel === modelName &&
+        this.currentImageResolution === (effectiveResolution ?? null)
+      ) {
+        this.appLogger.info(`Image server already running with model: ${modelName}`, this.name)
+        return
+      }
+
+      if (this.ovmsImageProcess) {
+        await this.stopOvmsImageServer()
+      }
+
+      if (!keepModelsLoaded) {
+        this.appLogger.info(
+          'Stopping LLM server to free GPU memory for image generation',
+          this.name,
+        )
+        await this.stopOvmsLlmServer()
+      }
+
+      await this.startOvmsImageServer(modelName, effectiveResolution)
+      this.appLogger.info(`Image server started successfully for model: ${modelName}`, this.name)
+    } catch (error) {
+      this.appLogger.error(
+        `Failed to start image server for model ${modelName}: ${error}`,
+        this.name,
+      )
+      throw error
+    }
+  }
+
+  /**
+   * Stop image generation server independently
+   */
+  async stopImageServer(): Promise<void> {
+    try {
+      this.appLogger.info('Stopping image server', this.name)
+      await this.stopOvmsImageServer()
+      this.appLogger.info('Image server stopped successfully', this.name)
+    } catch (error) {
+      this.appLogger.error(`Failed to stop image server: ${error}`, this.name)
+      throw error
+    }
+  }
+
+  /**
+   * Stop only the chat-related sub-servers (LLM + embedding) to free GPU memory,
+   * leaving transcription (STT), speech (TTS) and image servers running.
+   */
+  async stopChatServers(): Promise<void> {
+    try {
+      this.appLogger.info('Stopping chat servers (LLM + embedding)', this.name)
+      await this.stopOvmsLlmServer()
+      await this.stopOvmsEmbeddingServer()
+      this.appLogger.info('Chat servers stopped successfully', this.name)
+    } catch (error) {
+      this.appLogger.error(`Failed to stop chat servers: ${error}`, this.name)
+      throw error
+    }
+  }
+
+  /**
+   * Resolve the OVMS `--tool_parser` for a model from its models.json entry.
+   * Falls back to 'hermes3' when the model is unknown or has no override
+   * (Qwen3.x and most chat models emit Hermes-style <tool_call> tags).
+   */
+  private async resolveToolParser(modelRepoId: string): Promise<string> {
+    const fallback = 'hermes3'
+    try {
+      const models = await resolveModels(this.settings)
+      const parser = models.find((m) => m.name === modelRepoId)?.toolParser
+      if (parser) {
+        this.appLogger.info(`Using tool_parser '${parser}' for ${modelRepoId}`, this.name)
+        return parser
+      }
+    } catch (error) {
+      this.appLogger.warn(
+        `Failed to resolve tool_parser for ${modelRepoId}, using '${fallback}': ${error}`,
+        this.name,
+      )
+    }
+    return fallback
+  }
+
   // Model server management methods
   private async startOvmsLlmServer(
     modelRepoId: string,
@@ -830,6 +2071,8 @@ export class OpenVINOBackendService implements ApiService {
     try {
       const selectedDevice = this.devices.find((d) => d.selected)?.id || 'AUTO'
       const maxPromptLen = contextSize ?? 8192
+      const toolParser = await this.resolveToolParser(modelRepoId)
+      const servedModelName = modelRepoId.split('/').join('---')
 
       this.appLogger.info(
         `Starting OVMS server for model: ${modelRepoId} on port ${this.port} with device ${selectedDevice}`,
@@ -849,12 +2092,10 @@ export class OpenVINOBackendService implements ApiService {
         path.resolve(path.join(this.baseDir, 'models', 'LLM', 'openvino')),
         '--target_device',
         selectedDevice,
-        '--cache_size',
-        '2',
         '--task',
         'text_generation',
         '--tool_parser',
-        'hermes3',
+        toolParser,
         '--reasoning_parser',
         'qwen3',
         '--cache_dir',
@@ -865,21 +2106,22 @@ export class OpenVINOBackendService implements ApiService {
         args.push('--max_prompt_len', maxPromptLen.toString())
       }
 
+      // INT4/INT8 KV cache compression (experimental) lowers GPU memory usage,
+      // especially for long contexts. Only pass the flag when explicitly enabled;
+      // an empty value leaves OVMS on its default precision.
+      if (this.kvCachePrecision) {
+        args.push('--kv_cache_precision', this.kvCachePrecision)
+      }
+
       this.appLogger.info(`OVMS launch args: ${args.join(' ')}`, this.name)
 
-      // Set up environment variables as per setupvars.ps1
-      const pythonDir = path.join(this.ovmsDir, 'python')
-      const scriptsDir = path.join(this.ovmsDir, 'python', 'Scripts')
+      const extraLibPaths = await this.resolveOvmsExtraLibPaths()
+      const ovmsEnv = this.buildOvmsEnv(extraLibPaths)
 
       const childProcess = spawn(this.ovmsExePath, args, {
         cwd: this.ovmsDir,
         windowsHide: true,
-        env: {
-          ...process.env,
-          OVMS_DIR: this.ovmsDir,
-          PYTHONHOME: pythonDir,
-          PATH: `${this.ovmsDir};${pythonDir};${scriptsDir};${process.env.PATH}`,
-        },
+        env: ovmsEnv,
       })
 
       const healthUrl = `http://127.0.0.1:${this.port}/v2/health/ready`
@@ -906,8 +2148,11 @@ export class OpenVINOBackendService implements ApiService {
         this.appLogger.error(`OVMS LLM server process error: ${error}`, this.name)
       })
 
-      childProcess.on('exit', (code: number | null) => {
-        this.appLogger.info(`OVMS LLM server process exited with code: ${code}`, this.name)
+      childProcess.on('exit', (code: number | null, signal: string | null) => {
+        const exitReason = signal
+          ? `signal ${signal}${signal === 'SIGSEGV' ? ' (segmentation fault — possible ABI incompatibility or OOM)' : signal === 'SIGKILL' ? ' (killed — likely OOM killer)' : ''}`
+          : `code ${code}`
+        this.appLogger.info(`OVMS LLM server process exited with ${exitReason}`, this.name)
         if (this.ovmsLlmProcess === ovmsProcess) {
           this.ovmsLlmProcess = null
           this.currentModel = null
@@ -915,8 +2160,28 @@ export class OpenVINOBackendService implements ApiService {
         }
       })
 
-      // Wait for server to be ready
+      // Wait for the server process to accept connections (/v2/health/ready).
       await this.waitForServerReady(healthUrl, childProcess)
+
+      // /v2/health/ready flips ready when the *server* is up, but the MediaPipe
+      // text-generation graph that backs /v3/chat/completions can register a beat
+      // later — so a request racing that window 404s with "Mediapipe graph definition
+      // with requested name is not found". This bites the agentic image flow, which
+      // stops + restarts the chat server mid-turn (chatBackends → restartChatBackend)
+      // and then immediately issues a follow-up completion. Gate on the model's own
+      // KServe readiness endpoint so we only report ready once the graph is servable.
+      // Best-effort: some OVMS versions may not expose this per-graph — on timeout we
+      // log and proceed (the renderer's route-retry is the backstop) rather than fail
+      // an otherwise-healthy server.
+      const modelReadyUrl = `http://127.0.0.1:${this.port}/v2/models/${servedModelName}/ready`
+      try {
+        await this.waitForServerReady(modelReadyUrl, childProcess, 60)
+      } catch (graphError) {
+        this.appLogger.warn(
+          `OVMS graph readiness probe for "${servedModelName}" did not confirm within budget: ${graphError}`,
+          this.name,
+        )
+      }
       ovmsProcess.isReady = true
 
       this.ovmsLlmProcess = ovmsProcess
@@ -934,32 +2199,24 @@ export class OpenVINOBackendService implements ApiService {
     }
   }
 
+  /**
+   * Terminate an OVMS server process and its entire child tree.
+   *
+   * OVMS spawns worker subprocesses (--rest_workers) and an embedded Python, and
+   * runs with cwd set to the ovms directory. On Windows ChildProcess.kill() only
+   * signals the direct PID, so the workers survive and keep handles on the ovms
+   * binary/DLLs — and the live CWD itself — which makes a subsequent reinstall
+   * fail to delete the directory (EPERM/EBUSY). `taskkill /T /F` tears down the
+   * whole tree; we then wait for the OS to reap it and release the handles.
+   */
+  private async terminateProcessTree(proc: ChildProcess, label: string): Promise<void> {
+    await killProcessTree(proc, { name: this.name, label, appLogger: this.appLogger })
+  }
+
   private async stopOvmsLlmServer(): Promise<void> {
     if (this.ovmsLlmProcess) {
       this.appLogger.info(`Stopping OVMS LLM server for model: ${this.currentModel}`, this.name)
-      this.ovmsLlmProcess.process.kill('SIGTERM')
-
-      // Wait a bit for graceful shutdown, then force kill if needed
-      await new Promise<void>((resolve) => {
-        const currentProcess = this.ovmsLlmProcess
-        const timeout = setTimeout(() => {
-          if (currentProcess) {
-            this.appLogger.warn(`Force killing OVMS LLM server process`, this.name)
-            currentProcess.process.kill('SIGKILL')
-          }
-          resolve()
-        }, 5000)
-
-        if (currentProcess) {
-          currentProcess.process.on('exit', () => {
-            clearTimeout(timeout)
-            resolve()
-          })
-        } else {
-          clearTimeout(timeout)
-          resolve()
-        }
-      })
+      await this.terminateProcessTree(this.ovmsLlmProcess.process, 'LLM server')
 
       this.ovmsLlmProcess = null
       this.currentModel = null
@@ -1002,19 +2259,11 @@ export class OpenVINOBackendService implements ApiService {
 
       this.appLogger.info(`OVMS embedding launch args: ${args.join(' ')}`, this.name)
 
-      // Set up environment variables as per setupvars.ps1
-      const pythonDir = path.join(this.ovmsDir, 'python')
-      const scriptsDir = path.join(this.ovmsDir, 'python', 'Scripts')
-
+      const extraLibPaths = await this.resolveOvmsExtraLibPaths()
       const childProcess = spawn(this.ovmsExePath, args, {
         cwd: this.ovmsDir,
         windowsHide: true,
-        env: {
-          ...process.env,
-          OVMS_DIR: this.ovmsDir,
-          PYTHONHOME: pythonDir,
-          PATH: `${this.ovmsDir};${pythonDir};${scriptsDir};${process.env.PATH}`,
-        },
+        env: this.buildOvmsEnv(extraLibPaths),
       })
 
       const healthUrl = `http://127.0.0.1:${port}/v2/health/ready`
@@ -1072,29 +2321,7 @@ export class OpenVINOBackendService implements ApiService {
         `Stopping OVMS embedding server for model: ${this.currentEmbeddingModel}`,
         this.name,
       )
-      this.ovmsEmbeddingProcess.process.kill('SIGTERM')
-
-      // Wait a bit for graceful shutdown, then force kill if needed
-      await new Promise<void>((resolve) => {
-        const currentProcess = this.ovmsEmbeddingProcess
-        const timeout = setTimeout(() => {
-          if (currentProcess) {
-            this.appLogger.warn(`Force killing OVMS embedding server process`, this.name)
-            currentProcess.process.kill('SIGKILL')
-          }
-          resolve()
-        }, 5000)
-
-        if (currentProcess) {
-          currentProcess.process.on('exit', () => {
-            clearTimeout(timeout)
-            resolve()
-          })
-        } else {
-          clearTimeout(timeout)
-          resolve()
-        }
-      })
+      await this.terminateProcessTree(this.ovmsEmbeddingProcess.process, 'embedding server')
 
       this.ovmsEmbeddingProcess = null
       this.currentEmbeddingModel = null
@@ -1139,19 +2366,11 @@ export class OpenVINOBackendService implements ApiService {
 
       this.appLogger.info(`OVMS transcription launch args: ${args.join(' ')}`, this.name)
 
-      // Set up environment variables as per setupvars.ps1
-      const pythonDir = path.join(this.ovmsDir, 'python')
-      const scriptsDir = path.join(this.ovmsDir, 'python', 'Scripts')
-
+      const extraLibPaths = await this.resolveOvmsExtraLibPaths()
       const childProcess = spawn(this.ovmsExePath, args, {
         cwd: this.ovmsDir,
         windowsHide: true,
-        env: {
-          ...process.env,
-          OVMS_DIR: this.ovmsDir,
-          PYTHONHOME: pythonDir,
-          PATH: `${this.ovmsDir};${pythonDir};${scriptsDir};${process.env.PATH}`,
-        },
+        env: this.buildOvmsEnv(extraLibPaths),
       })
 
       const healthUrl = `http://127.0.0.1:${port}/v2/health/ready`
@@ -1212,32 +2431,240 @@ export class OpenVINOBackendService implements ApiService {
         `Stopping OVMS transcription server for model: ${this.currentTranscriptionModel}`,
         this.name,
       )
-      this.ovmsTranscriptionProcess.process.kill('SIGTERM')
-
-      // Wait a bit for graceful shutdown, then force kill if needed
-      await new Promise<void>((resolve) => {
-        const currentProcess = this.ovmsTranscriptionProcess
-        const timeout = setTimeout(() => {
-          if (currentProcess) {
-            this.appLogger.warn(`Force killing OVMS transcription server process`, this.name)
-            currentProcess.process.kill('SIGKILL')
-          }
-          resolve()
-        }, 5000)
-
-        if (currentProcess) {
-          currentProcess.process.on('exit', () => {
-            clearTimeout(timeout)
-            resolve()
-          })
-        } else {
-          clearTimeout(timeout)
-          resolve()
-        }
-      })
+      await this.terminateProcessTree(this.ovmsTranscriptionProcess.process, 'transcription server')
 
       this.ovmsTranscriptionProcess = null
       this.currentTranscriptionModel = null
+    }
+  }
+
+  private async startOvmsSpeechServer(modelRepoId: string): Promise<OvmsServerProcess> {
+    try {
+      // The TTS model (SpeechT5) is CPU-only under OVMS, so ignore the selected GPU/NPU device.
+      const selectedDevice = 'CPU'
+      const port = await getPort({ port: portNumbers(29400, 29499) })
+      // Validate model path exists
+      this.resolveSpeechModelPath(modelRepoId)
+      const modelName = modelRepoId.split('/').join('---')
+
+      this.appLogger.info(
+        `Starting OVMS speech server for model: ${modelRepoId} on port ${port} with device ${selectedDevice}`,
+        this.name,
+      )
+
+      const args = [
+        '--rest_bind_address',
+        '127.0.0.1',
+        '--rest_port',
+        port.toString(),
+        '--rest_workers',
+        '2',
+        '--source_model',
+        modelName,
+        '--model_repository_path',
+        path.resolve(path.join(this.baseDir, 'models', 'TTS')),
+        '--model_name',
+        modelName,
+        '--target_device',
+        selectedDevice,
+        '--task',
+        'text2speech',
+        '--model_type',
+        'kokoro',
+        '--cache_dir',
+        'cache',
+      ]
+
+      this.appLogger.info(`OVMS speech launch args: ${args.join(' ')}`, this.name)
+
+      // Set up environment variables as per setupvars.ps1
+      const pythonDir = path.join(this.ovmsDir, 'python')
+      const scriptsDir = path.join(this.ovmsDir, 'python', 'Scripts')
+
+      const childProcess = spawn(this.ovmsExePath, args, {
+        cwd: this.ovmsDir,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          OVMS_DIR: this.ovmsDir,
+          PYTHONHOME: pythonDir,
+          PATH: `${this.ovmsDir};${pythonDir};${scriptsDir};${process.env.PATH}`,
+        },
+      })
+
+      const healthUrl = `http://127.0.0.1:${port}/v2/health/ready`
+      const ovmsProcess: OvmsServerProcess = {
+        process: childProcess,
+        port,
+        modelRepoId,
+        type: 'speech',
+        isReady: false,
+        healthEndpointUrl: healthUrl,
+      }
+
+      // Set up process event handlers
+      childProcess.stdout!.on('data', (message) => {
+        this.appLogger.info(`[OVMS Speech] ${message}`, this.name)
+      })
+
+      childProcess.stderr!.on('data', (message) => {
+        this.appLogger.error(`[OVMS Speech] ${message}`, this.name)
+      })
+
+      childProcess.on('error', (error: Error) => {
+        this.appLogger.error(`OVMS speech server process error: ${error}`, this.name)
+      })
+
+      childProcess.on('exit', (code: number | null) => {
+        this.appLogger.info(`OVMS speech server process exited with code: ${code}`, this.name)
+        if (this.ovmsSpeechProcess === ovmsProcess) {
+          this.ovmsSpeechProcess = null
+          this.currentSpeechModel = null
+        }
+      })
+
+      // Wait for server to be ready
+      await this.waitForServerReady(healthUrl, childProcess, 600)
+      ovmsProcess.isReady = true
+
+      this.ovmsSpeechProcess = ovmsProcess
+      this.currentSpeechModel = modelRepoId
+
+      this.appLogger.info(`OVMS speech server ready for model: ${modelRepoId}`, this.name)
+      return ovmsProcess
+    } catch (error) {
+      this.appLogger.error(
+        `Failed to start OVMS speech server for model ${modelRepoId}: ${error}`,
+        this.name,
+      )
+      throw error
+    }
+  }
+
+  private async stopOvmsSpeechServer(): Promise<void> {
+    if (this.ovmsSpeechProcess) {
+      this.appLogger.info(
+        `Stopping OVMS speech server for model: ${this.currentSpeechModel}`,
+        this.name,
+      )
+      await this.terminateProcessTree(this.ovmsSpeechProcess.process, 'speech server')
+
+      this.ovmsSpeechProcess = null
+      this.currentSpeechModel = null
+    }
+  }
+
+  private async startOvmsImageServer(
+    modelRepoId: string,
+    resolution?: string,
+  ): Promise<OvmsServerProcess> {
+    try {
+      const selectedDevice = this.devices.find((d) => d.selected)?.id || 'AUTO'
+      const port = await getPort({ port: portNumbers(29300, 29399) })
+
+      this.appLogger.info(
+        `Starting OVMS image server for model: ${modelRepoId} on port ${port} with device ${selectedDevice}`,
+        this.name,
+      )
+
+      const args = [
+        '--rest_bind_address',
+        '127.0.0.1',
+        '--rest_port',
+        port.toString(),
+        '--source_model',
+        modelRepoId.split('/').join('---'),
+        '--model_repository_path',
+        path.resolve(path.join(this.baseDir, 'models', 'openvino-image')),
+        '--target_device',
+        selectedDevice,
+        '--task',
+        'image_generation',
+        '--cache_dir',
+        'cache',
+      ]
+
+      // NPU requires the image generation pipeline to be reshaped to a static shape.
+      // See: https://docs.openvino.ai/2025/model-server/ovms_docs_parameters.html#image-generation
+      if (selectedDevice.startsWith('NPU')) {
+        if (!resolution) {
+          throw new Error(
+            'OVMS image generation on NPU requires a static resolution but none was provided',
+          )
+        }
+        args.push('--resolution', resolution)
+      }
+
+      this.appLogger.info(`OVMS image launch args: ${args.join(' ')}`, this.name)
+
+      const extraLibPaths = await this.resolveOvmsExtraLibPaths()
+      const childProcess = spawn(this.ovmsExePath, args, {
+        cwd: this.ovmsDir,
+        windowsHide: true,
+        env: this.buildOvmsEnv(extraLibPaths),
+      })
+
+      const healthUrl = `http://127.0.0.1:${port}/v2/health/ready`
+      const ovmsProcess: OvmsServerProcess = {
+        process: childProcess,
+        port,
+        modelRepoId,
+        type: 'image_generation',
+        isReady: false,
+        healthEndpointUrl: healthUrl,
+      }
+
+      childProcess.stdout!.on('data', (message) => {
+        this.appLogger.info(`[OVMS Image] ${message}`, this.name)
+      })
+
+      childProcess.stderr!.on('data', (message) => {
+        this.appLogger.error(`[OVMS Image] ${message}`, this.name)
+      })
+
+      childProcess.on('error', (error: Error) => {
+        this.appLogger.error(`OVMS image server process error: ${error}`, this.name)
+      })
+
+      childProcess.on('exit', (code: number | null) => {
+        this.appLogger.info(`OVMS image server process exited with code: ${code}`, this.name)
+        if (this.ovmsImageProcess === ovmsProcess) {
+          this.ovmsImageProcess = null
+          this.currentImageModel = null
+          this.currentImageResolution = null
+        }
+      })
+
+      // Image model loading can be slow — use high maxAttempts
+      await this.waitForServerReady(healthUrl, childProcess, 600)
+      ovmsProcess.isReady = true
+
+      this.ovmsImageProcess = ovmsProcess
+      this.currentImageModel = modelRepoId
+      this.currentImageResolution = resolution ?? null
+
+      this.appLogger.info(`OVMS image server ready for model: ${modelRepoId}`, this.name)
+      return ovmsProcess
+    } catch (error) {
+      this.appLogger.error(
+        `Failed to start OVMS image server for model ${modelRepoId}: ${error}`,
+        this.name,
+      )
+      throw error
+    }
+  }
+
+  private async stopOvmsImageServer(): Promise<void> {
+    if (this.ovmsImageProcess) {
+      this.appLogger.info(
+        `Stopping OVMS image server for model: ${this.currentImageModel}`,
+        this.name,
+      )
+      await this.terminateProcessTree(this.ovmsImageProcess.process, 'image server')
+
+      this.ovmsImageProcess = null
+      this.currentImageModel = null
+      this.currentImageResolution = null
     }
   }
 
@@ -1271,54 +2698,32 @@ export class OpenVINOBackendService implements ApiService {
     return modelDir
   }
 
-  private async waitForServerReady(
-    healthUrl: string,
-    process: ChildProcess,
-    maxAttempts = 120,
-  ): Promise<void> {
-    const delayMs = 1000
+  private resolveSpeechModelPath(modelRepoId: string): string {
+    // Mirror transcription resolution - speech models live under models/TTS
+    const modelBasePath = 'models/TTS'
+    const [namespace, repo, ...model] = modelRepoId.split('/')
+    const modelDir = path.resolve(
+      path.join(this.baseDir, modelBasePath, `${namespace}---${repo}`, model.join('/')),
+    )
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      // Check if process has exited before attempting health check
-      if (!process || process.killed) {
-        this.appLogger.warn(
-          `Process for ${this.name} is not alive, aborting health check`,
-          this.name,
-        )
-        throw new Error(`Process exited before server became ready`)
-      }
-
-      try {
-        const response = await fetch(healthUrl, {
-          method: 'GET',
-          signal: AbortSignal.timeout(1000),
-        })
-
-        if (response.ok) {
-          // Double-check process is still alive before accepting success
-          if (!process || process.killed) {
-            this.appLogger.warn(
-              `Process for ${this.name} exited after health check succeeded, marking as failed`,
-              this.name,
-            )
-            throw new Error(`Process exited after health check succeeded`)
-          }
-          this.appLogger.info(`Server ready at ${healthUrl}`, this.name)
-          return
-        }
-      } catch (_error) {
-        // Server not ready yet, continue waiting
-        // But check if process is still alive
-        if (!process || process.killed) {
-          this.appLogger.warn(`Process for ${this.name} exited during health check wait`, this.name)
-          throw new Error(`Process exited during server startup`)
-        }
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, delayMs))
+    if (!filesystem.existsSync(modelDir)) {
+      throw new Error(`Speech model directory not found: ${modelDir}`)
     }
 
-    throw new Error(`Server failed to start within ${(maxAttempts * delayMs) / 1000} seconds`)
+    return modelDir
+  }
+
+  private async waitForServerReady(
+    healthUrl: string,
+    childProcess: ChildProcess,
+    maxAttempts = 120,
+  ): Promise<void> {
+    await waitForServerReadyOrThrow(healthUrl, childProcess, {
+      name: this.name,
+      maxAttempts,
+      captureExitDiagnostics: true,
+      appLogger: this.appLogger,
+    })
   }
 
   // Error management methods for startup failures
@@ -1337,11 +2742,14 @@ export class OpenVINOBackendService implements ApiService {
   async uninstall(): Promise<void> {
     await this.stop()
     this.appLogger.info(`removing OpenVINO Model Server directory`, this.name)
-    await filesystem.remove(this.ovmsDir)
+    await this.removeDirWithRetry(this.ovmsDir)
     this.appLogger.info(`removed OpenVINO Model Server directory`, this.name)
     this.setStatus('notInstalled')
     this.isSetUp = false
     // Clear startup errors when uninstalling
     this.clearLastStartupError()
+    // Invalidate cached lib paths so they are re-resolved after reinstall
+    this.cachedOvmsExtraLibPaths = null
+    this.ovmsEmbeddedPythonHome = null
   }
 }

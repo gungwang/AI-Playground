@@ -15,7 +15,25 @@
         @update:variant="handleVariantChange"
       />
 
-      <div class="flex flex-col gap-4">
+      <!-- When the Home Agent preset is the active chat preset, surface a
+           global-settings warning. These knobs apply to every Home Agent
+           conversation (Telegram + desktop), so changes can lock the user
+           out of remote access if not verified. -->
+      <div
+        v-if="isHomeAgentPresetActive"
+        class="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-3 text-sm text-foreground"
+      >
+        <p class="font-semibold text-amber-600 dark:text-amber-200">Global Home Agent Settings</p>
+        <p class="text-xs text-muted-foreground">
+          The settings for this preset impact all Home Agent conversations. Please verify after
+          changing them to ensure that you can still access AI Playground remotely.
+        </p>
+      </div>
+
+      <!-- TTS preset: a direct Qwen3-TTS synthesizer, no LLM controls. -->
+      <SettingsTts v-if="isTtsPreset" />
+
+      <div v-else class="flex flex-col gap-4">
         <!-- Backend selector - only shown when multiple backends are available -->
         <div v-if="!isBackendLocked" class="grid grid-cols-[120px_1fr] items-center gap-4">
           <Label class="whitespace-nowrap">Backend</Label>
@@ -26,13 +44,26 @@
             :items="availableBackendItems"
           ></drop-down-new>
         </div>
-        <div v-if="!lockDeviceToNpu" class="grid grid-cols-[120px_1fr] items-center gap-4">
+        <!-- Cloud Mode swaps the hardware "Device" picker for a remote "Provider" picker. -->
+        <div
+          v-if="textInference.backend === 'cloud'"
+          class="grid grid-cols-[120px_1fr] items-center gap-4"
+        >
+          <Label class="whitespace-nowrap">Provider</Label>
+          <ProviderSelector />
+        </div>
+        <div v-else class="grid grid-cols-[120px_1fr] items-center gap-4">
           <Label class="whitespace-nowrap">{{ languages.DEVICE }}</Label>
-          <DeviceSelector :backend="backendToService[textInference.backend]" />
+          <DeviceSelector :backend="deviceServiceName" />
         </div>
         <div class="grid grid-cols-[120px_1fr] items-center gap-4">
           <Label class="whitespace-nowrap">{{ languages.MODEL }}</Label>
-          <ModelSelector />
+          <div class="flex items-center gap-2 min-w-0">
+            <div class="flex-1 min-w-0">
+              <ModelSelector />
+            </div>
+            <CapabilityIcons v-if="currentModel" :model="currentModel" />
+          </div>
         </div>
         <Button
           variant="secondary"
@@ -92,39 +123,82 @@
             @click="() => (textInference.metricsEnabled = !textInference.metricsEnabled)"
           />
         </div>
-        <!-- Built-in Tools toggle - only shown when preset has showTools enabled -->
+        <!-- Thinking toggle - only shown for models whose template supports enable_thinking -->
         <div
-          v-if="showTools && textInference.modelSupportsToolCalling"
+          v-if="textInference.modelSupportsThinkingToggle"
           class="grid grid-cols-[120px_1fr] items-center gap-4"
         >
-          <Label class="whitespace-nowrap">Built-in tools:</Label>
+          <Label class="whitespace-nowrap">Thinking</Label>
           <Checkbox
-            id="tools"
-            :model-value="textInference.aipgToolsEnabled"
-            @click="() => (textInference.aipgToolsEnabled = !textInference.aipgToolsEnabled)"
+            id="thinking"
+            :model-value="textInference.thinkingEnabled"
+            @click="() => (textInference.thinkingEnabled = !textInference.thinkingEnabled)"
           />
         </div>
+        <!-- Tools require a tool-calling model. The toggles stay visible so the
+             option is discoverable, but are disabled (greyed) when the selected
+             model can't call tools. -->
+        <template v-if="showTools">
+          <!-- Built-in Tools toggle -->
+          <div
+            class="grid grid-cols-[120px_1fr] items-center gap-4"
+            :class="{ 'opacity-50': !textInference.modelSupportsToolCalling }"
+            :title="
+              !textInference.modelSupportsToolCalling
+                ? 'The selected model does not support tool calling.'
+                : undefined
+            "
+          >
+            <Label class="whitespace-nowrap">Built-in tools:</Label>
+            <Checkbox
+              id="tools"
+              :disabled="!textInference.modelSupportsToolCalling"
+              :model-value="textInference.aipgToolsEnabled"
+              @click="
+                textInference.modelSupportsToolCalling &&
+                (textInference.aipgToolsEnabled = !textInference.aipgToolsEnabled)
+              "
+            />
+          </div>
 
-        <!-- MCP Tools toggle -->
-        <div
-          v-if="showTools && textInference.modelSupportsToolCalling"
-          class="grid grid-cols-[120px_1fr] items-center gap-4"
-        >
-          <Label class="whitespace-nowrap">MCP tools:</Label>
-          <Checkbox
-            id="mcp-tools"
-            :model-value="textInference.mcpToolsEnabled"
-            @click="() => (textInference.mcpToolsEnabled = !textInference.mcpToolsEnabled)"
-          />
-        </div>
+          <div
+            v-if="textInference.modelSupportsToolCalling"
+            class="pl-2"
+            :class="{ 'opacity-50': !textInference.aipgToolsEnabled }"
+          >
+            <SettingsBuiltinTools />
+          </div>
 
-        <div
-          v-if="showTools && textInference.modelSupportsToolCalling"
-          class="pl-2 pt-2"
-          :class="{ 'opacity-50': !textInference.mcpToolsEnabled }"
-        >
-          <SettingsMcp />
-        </div>
+          <!-- MCP Tools toggle -->
+          <div
+            class="grid grid-cols-[120px_1fr] items-center gap-4"
+            :class="{ 'opacity-50': !textInference.modelSupportsToolCalling }"
+            :title="
+              !textInference.modelSupportsToolCalling
+                ? 'The selected model does not support tool calling.'
+                : undefined
+            "
+          >
+            <Label class="whitespace-nowrap">MCP tools:</Label>
+            <Checkbox
+              id="mcp-tools"
+              :disabled="!textInference.modelSupportsToolCalling"
+              :model-value="textInference.mcpToolsEnabled"
+              @click="
+                textInference.modelSupportsToolCalling &&
+                (textInference.mcpToolsEnabled = !textInference.mcpToolsEnabled)
+              "
+            />
+          </div>
+
+          <div
+            v-if="textInference.modelSupportsToolCalling"
+            class="pl-2 pt-2"
+            :class="{ 'opacity-50': !textInference.mcpToolsEnabled }"
+          >
+            <SettingsMcp />
+          </div>
+        </template>
 
         <!-- Embeddings selector - only shown when RAG is enabled -->
         <div v-if="enableRAG" class="grid grid-cols-[120px_1fr] items-center gap-4">
@@ -182,6 +256,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
 import { Slider } from '@/components/ui/slider'
 import { Textarea } from '@/components/ui/textarea'
+
 import {
   backendToService,
   LlmBackend,
@@ -189,12 +264,16 @@ import {
   textInferenceBackendDisplayName,
 } from '@/assets/js/store/textInference.ts'
 import DeviceSelector from '@/components/DeviceSelector.vue'
+import ProviderSelector from '@/components/ProviderSelector.vue'
 import ModelSelector from '@/components/ModelSelector.vue'
+import CapabilityIcons from '@/components/CapabilityIcons.vue'
 import AddLLMDialog from '@/components/AddLLMDialog.vue'
 import { ref, computed } from 'vue'
 import { useI18N } from '@/assets/js/store/i18n.ts'
 import Rag from '@/components/Rag.vue'
 import SettingsMcp from '@/components/SettingsMcp.vue'
+import SettingsBuiltinTools from '@/components/SettingsBuiltinTools.vue'
+import SettingsTts from '@/components/SettingsTts.vue'
 import { useBackendServices } from '@/assets/js/store/backendServices.ts'
 import DropDownNew from '@/components/DropDownNew.vue'
 import { usePresets, type ChatPreset } from '@/assets/js/store/presets.ts'
@@ -202,6 +281,9 @@ import { usePresetSwitching } from '@/assets/js/store/presetSwitching.ts'
 import PresetSelector from '@/components/PresetSelector.vue'
 import * as toast from '@/assets/js/toast'
 import { useProductMode } from '@/assets/js/store/productMode'
+import { useConversations, HOME_AGENT_CHAT_PRESET_NAME } from '@/assets/js/store/conversations'
+import { useHomeAgent } from '@/assets/js/store/homeAgent'
+import { useCloudMode } from '@/assets/js/store/cloudMode'
 
 const showModelRequestDialog = ref(false)
 const showUploader = ref(false)
@@ -212,6 +294,19 @@ const presetsStore = usePresets()
 const presetSwitching = usePresetSwitching()
 const backendServices = useBackendServices()
 const productModeStore = useProductMode()
+const conversations = useConversations()
+const homeAgent = useHomeAgent()
+const cloudMode = useCloudMode()
+
+// Non-null service name for the local-backend DeviceSelector (only rendered for
+// non-cloud backends; cloud uses ProviderSelector instead).
+const deviceServiceName = computed(
+  () => backendToService[textInference.backend] ?? 'llamacpp-backend',
+)
+
+const isHomeAgentPresetActive = computed(
+  () => presetsStore.activePresetName === HOME_AGENT_CHAT_PRESET_NAME,
+)
 
 // Get the active chat preset
 const activeChatPreset = computed(() => {
@@ -225,17 +320,29 @@ const isBackendLocked = computed(() => {
   return activeChatPreset.value?.backends?.length === 1
 })
 
+// Direct Text-to-Speech preset: hides all LLM controls in favour of SettingsTts.
+const isTtsPreset = computed(() => activeChatPreset.value?.ttsPreset === true)
+
+// Active model (capabilities) for the icon row next to the selector — same
+// source as ModelSelector / PromptStatusBar.
+const currentModel = computed(() =>
+  textInference.llmModels.find((m) => m.active && m.type === textInference.backend),
+)
+
 // UI visibility flags from preset
 const enableRAG = computed(() => activeChatPreset.value?.enableRAG ?? false)
 const showTools = computed(() => activeChatPreset.value?.showTools ?? false)
-const lockDeviceToNpu = computed(() => activeChatPreset.value?.lockDeviceToNpu ?? false)
 const advancedMode = computed(() => activeChatPreset.value?.advancedMode ?? false)
 
 // Get available backends from preset (fallback when none configured on preset)
 const availableBackends = computed(() => {
-  const base = activeChatPreset.value?.backends ?? (['llamaCPP', 'openVINO'] as LlmBackend[])
+  let base = activeChatPreset.value?.backends ?? (['llamaCPP', 'openVINO'] as LlmBackend[])
   if (productModeStore.productMode === 'nvidia') {
-    return base.filter((b) => b !== 'openVINO')
+    base = base.filter((b) => b !== 'openVINO')
+  }
+  // Surface Cloud Mode as a selectable backend whenever the feature is enabled.
+  if (cloudMode.isFeatureEnabled && !base.includes('cloud')) {
+    base = [...base, 'cloud']
   }
   return base
 })
@@ -252,14 +359,36 @@ const availableBackendItems = computed(() => {
 // Handle backend change from dropdown
 function handleBackendChange(newBackend: string) {
   textInference.backend = newBackend as LlmBackend
+  // Switching to Cloud Mode refreshes the selected provider's model list
+  // (overwriting it on success) so the picker reflects the live provider state.
+  if (newBackend === 'cloud') {
+    cloudMode.refreshSelectedProviderModels()
+  }
 }
 
 async function handlePresetChange(presetName: string) {
+  // Route the active conversation alongside the preset:
+  //   • picking Home Agent jumps to the most-recently routed Home Agent thread
+  //     (so the Telegram bridge and this view share the same conversation)
+  //   • picking any other chat preset off a Home Agent thread spawns a fresh
+  //     main conversation so the user isn't writing into Home Agent state
+  //     with a non-Home-Agent preset.
+  const switchingToHomeAgent = presetName === HOME_AGENT_CHAT_PRESET_NAME
+  const onHomeAgentThread = conversations.getThreadKind(conversations.activeKey) === 'homeAgent'
+
   const result = await presetSwitching.switchPreset(presetName, {
     skipModeSwitch: true, // We're already in chat mode
   })
 
   if (result.success) {
+    // Only reroute the conversation after the preset switch actually succeeds —
+    // otherwise a failed switch would leave the UI on a different thread while
+    // the picker stayed on the previous preset.
+    if (switchingToHomeAgent) {
+      conversations.activeKey = homeAgent.ensureActiveRemoteConversation()
+    } else if (onHomeAgentThread) {
+      conversations.addNewConversation()
+    }
     toast.success(`Switched to ${presetName}`)
   } else if (result.error) {
     toast.error(`Failed to switch preset: ${result.error}`)
@@ -295,6 +424,9 @@ const documentStats = computed(() => {
 })
 
 function isBackendRunning(backend: LlmBackend): boolean {
+  // Cloud Mode has no local service — it's "ready" once a provider base URL
+  // is configured.
+  if (backend === 'cloud') return !!cloudMode.activeProviderBaseUrl
   const serviceName = backendToService[backend]
   return backendServices.info.find((item) => item.serviceName === serviceName)?.status === 'running'
 }

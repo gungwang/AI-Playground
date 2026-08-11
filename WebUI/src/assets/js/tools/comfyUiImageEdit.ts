@@ -1,16 +1,30 @@
 import { z } from 'zod'
 import { watch } from 'vue'
 import { FilePart, ModelMessage, tool } from 'ai'
-import { useImageGenerationPresets, type MediaItem } from '../store/imageGenerationPresets'
+import { useImageGenerationPresets } from '../store/imageGenerationPresets'
 import { useComfyUiPresets } from '../store/comfyUiPresets'
 import { useBackendServices } from '../store/backendServices'
+import { useActivities } from '../store/activities'
+import { useConversations } from '../store/conversations'
+import { useI18N } from '../store/i18n'
 import { usePresets, type Preset } from '../store/presets'
+import { useTextInference } from '../store/textInference'
 import { usePresetSwitching } from '../store/presetSwitching'
 import { usePromptStore } from '../store/promptArea'
 import { useDeveloperSettings } from '../store/developerSettings'
-import { chatBackends, restartChatBackend } from './chatBackends'
+import { stopChatBackends, restartChatBackend } from './chatBackends'
+import { imageUrlToDataUri } from '@/lib/utils'
+import { isCancellation } from '../errors/appError'
 
-const ImageEditOutputSchema = z.object({
+/**
+ * Idle/stall watchdog window. The timeout is re-armed on every progress signal
+ * (tracked item, currentState, or stepText change), so long-but-healthy renders
+ * like LTX image-to-video run to completion. It only fires after this long with
+ * NO progress — i.e. the backend is genuinely stuck.
+ */
+const GENERATION_IDLE_TIMEOUT_MS = 5 * 60_000
+
+const ImageEditImageOutputSchema = z.object({
   id: z.string(),
   type: z.literal('image'),
   imageUrl: z.string(),
@@ -18,9 +32,35 @@ const ImageEditOutputSchema = z.object({
   settings: z.record(z.string(), z.unknown()),
 })
 
+const ImageEditVideoOutputSchema = z.object({
+  id: z.string(),
+  type: z.literal('video'),
+  videoUrl: z.string(),
+  mode: z.literal('imageEdit'),
+  settings: z.record(z.string(), z.unknown()),
+})
+
+const ImageEditModel3DOutputSchema = z.object({
+  id: z.string(),
+  type: z.literal('model3d'),
+  model3dUrl: z.string(),
+  mode: z.literal('imageEdit'),
+  settings: z.record(z.string(), z.unknown()),
+})
+
+// Edit-category workflows can yield images (e.g. "Edit By Prompt") or other
+// media (e.g. "Image To 3D Model" → model3d). Mirror the multi-media output
+// of the create-images `comfyUI` tool so 3D / video edit workflows can
+// actually complete their tool call.
+const ImageEditMediaOutputSchema = z.discriminatedUnion('type', [
+  ImageEditImageOutputSchema,
+  ImageEditVideoOutputSchema,
+  ImageEditModel3DOutputSchema,
+])
+
 export const ImageEditToolOutputSchema = z
   .object({
-    images: z.array(ImageEditOutputSchema),
+    images: z.array(ImageEditMediaOutputSchema),
     success: z.boolean().optional(),
     message: z.string().optional(),
   })
@@ -114,43 +154,24 @@ function findSourceImage(messages: ModelMessage[]): string | null {
   return findImageInCurrentPrompt(messages) ?? findLatestImageInConversation(messages)
 }
 
-async function convertToDataUri(imageUrl: string): Promise<string> {
-  if (imageUrl.startsWith('data:image/')) {
-    return imageUrl
-  }
-
-  if (imageUrl.startsWith('aipg-media://')) {
-    console.log('[ComfyUIImageEdit Tool] Converting to data:image/ URI:', imageUrl)
-    const response = await fetch(imageUrl)
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image: ${response.statusText}`)
-    }
-    const blob = await response.blob()
-    return new Promise<string>((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onloadend = () => resolve(reader.result as string)
-      reader.onerror = reject
-      reader.readAsDataURL(blob)
-    })
-  }
-
-  throw new Error(`Unsupported image URL format: ${imageUrl}`)
-}
-
 export function getAvailableEditWorkflows(): Array<{
   name: string
+  mediaType?: 'image' | 'video' | 'model3d'
   description?: string
   toolInstructions?: string
 }> {
   const presets = usePresets()
+  const textInference = useTextInference()
   return presets.presets
     .filter((p: Preset) => {
       if (!(p.type === 'comfy' && p.backend === 'comfyui')) return false
       if (p.toolCategory !== 'edit-images') return false
-      return true
+      // Honour the per-workflow sub-checkboxes (Settings › Built-in tools).
+      return textInference.isWorkflowPresetEnabled(p.name)
     })
     .map((p: Preset) => ({
       name: p.name,
+      mediaType: p.mediaType,
       description: p.description,
       toolInstructions: p.toolInstructions,
     }))
@@ -164,24 +185,6 @@ function findFastVariant(preset: Preset): string | null {
 function getPresetDefault(preset: Preset, settingName: string): unknown {
   return preset.settings.find((s: { settingName?: string }) => s.settingName === settingName)
     ?.defaultValue
-}
-
-async function stopChatBackend(): Promise<void> {
-  console.log('[ComfyUIImageEdit Tool] Stopping chat backend to free resources for image editing')
-  const backendServices = useBackendServices()
-
-  // Stop any running chat backends to free up memory/resources
-  for (const serviceName of chatBackends) {
-    const backend = backendServices.info.find((s) => s.serviceName === serviceName)
-    console.log(`[ComfyUIImageEdit Tool] Checking backend "${serviceName}":`, backend)
-    try {
-      console.log(`[ComfyUIImageEdit Tool]  Backend: ${serviceName}, status: ${backend?.status}`)
-      console.log(`[ComfyUIImageEdit Tool] Stopping ${serviceName}...`)
-      await backendServices.stopService(serviceName)
-    } catch (error) {
-      console.warn(`[ComfyUIImageEdit Tool] Failed to stop ${serviceName}:`, error)
-    }
-  }
 }
 
 type ImageEditArgs = {
@@ -229,6 +232,7 @@ function saveCurrentState(
         variant: originalState.variant ?? undefined,
         skipModeSwitch: true,
         skipLastUsedUpdate: true,
+        skipMemoryAlert: true,
       })
     }
   }
@@ -242,21 +246,43 @@ export async function executeImageEdit(
 ): Promise<ImageEditToolOutput> {
   console.log('[ComfyUIImageEdit Tool] Starting generation with args:', args)
 
-  // avoid network issues from killing the chat BE while tool call is still streaming
-  const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-  await delay(100)
-
-  if (!useDeveloperSettings().keepModelsLoaded) {
-    await stopChatBackend()
-  }
-
+  const activities = useActivities()
+  const conversations = useConversations()
+  const i18nState = useI18N().state
   const imageGeneration = useImageGenerationPresets()
   const comfyUi = useComfyUiPresets()
   const backendServices = useBackendServices()
   const presets = usePresets()
 
+  // Surface the tool call as a chat activity ("Editing image…") and nest the
+  // image-gen FSM phases under it so the chat status line shows live progress.
+  const toolActivityId = activities.begin({
+    category: 'tools',
+    label: i18nState.COM_ACTIVITY_EDITING_IMAGE,
+    scope: { kind: 'chat', conversationKey: conversations.activeKey },
+  })
+  imageGeneration.generationParentActivityId = toolActivityId
+  let toolActivityEnded = false
+  const finishToolActivity = (state: 'done' | 'failed' = 'done') => {
+    if (toolActivityEnded) return
+    toolActivityEnded = true
+    imageGeneration.generationParentActivityId = null
+    activities.end(toolActivityId, state)
+  }
+
+  if (!useDeveloperSettings().keepModelsLoaded) {
+    // Wait for any in-flight chat stream (the request that carried this tool
+    // call) to finish before freeing the GPU, so stopping the chat backend
+    // can't reset an open llama.cpp socket mid-stream (=> "network error").
+    // Replaces a fixed 100ms guess; bounded internally so a stuck stream can't
+    // hang generation.
+    await useTextInference().waitForInferenceIdle()
+    await stopChatBackends()
+  }
+
   const sourceImageUrl = findSourceImage(messages)
   if (!sourceImageUrl) {
+    finishToolActivity('failed')
     return createErrorResult(
       'No image found in conversation. Please upload an image or generate one first.',
     )
@@ -265,6 +291,7 @@ export async function executeImageEdit(
 
   const comfyUiService = backendServices.info.find((s) => s.serviceName === 'comfyui-backend')
   if (!comfyUiService || comfyUiService.status !== 'running') {
+    finishToolActivity('failed')
     return createErrorResult('ComfyUI backend is not running. Please start it first.')
   }
 
@@ -274,6 +301,7 @@ export async function executeImageEdit(
     null
 
   if (!preset || preset.type !== 'comfy') {
+    finishToolActivity('failed')
     return createErrorResult('No image edit presets available')
   }
 
@@ -293,6 +321,7 @@ export async function executeImageEdit(
   if (selectedVariant) presets.setActiveVariant(preset.name, selectedVariant)
   const presetWithVariant = presets.getPresetWithVariant(preset.name)
   if (!presetWithVariant) {
+    finishToolActivity('failed')
     return createErrorResult(`Failed to apply preset "${preset.name}"`)
   }
   preset = presetWithVariant
@@ -306,6 +335,7 @@ export async function executeImageEdit(
       variant: selectedVariant ?? undefined,
       skipModeSwitch: true,
       skipLastUsedUpdate: true,
+      skipMemoryAlert: true,
     })
     if (!switchResult.success) {
       return createErrorResult(`Failed to switch to preset "${preset.name}"`)
@@ -336,7 +366,9 @@ export async function executeImageEdit(
 
     const imageInput = imageGeneration.comfyInputs.find(
       (input) =>
-        (input.type === 'image' || input.type === 'inpaintMask') &&
+        (input.type === 'image' ||
+          input.type === 'inpaintMask' ||
+          input.type === 'outpaintCanvas') &&
         input.displayed !== false &&
         input.modifiable !== false &&
         (input.defaultValue === '' || input.defaultValue === undefined),
@@ -349,7 +381,7 @@ export async function executeImageEdit(
     }
 
     try {
-      const dataUri = await convertToDataUri(sourceImageUrl)
+      const dataUri = await imageUrlToDataUri(sourceImageUrl)
       imageInput.current.value = dataUri
     } catch (error) {
       return createErrorResult(
@@ -362,42 +394,111 @@ export async function executeImageEdit(
 
     await comfyUi.generate([imageId], 'imageEdit', sourceImageUrl)
 
-    const result = await new Promise<ImageEditToolOutput>((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error('Image edit timed out after 5 minutes')),
-        300000,
-      )
+    const result = await new Promise<ImageEditToolOutput>((resolve) => {
+      let timeout: ReturnType<typeof setTimeout> | null = null
+      let stopWatcher: (() => void) | null = null
 
-      const checkCompletion = () => {
-        const completed = imageGeneration.generatedImages.find(
-          (item): item is MediaItem =>
-            item.id === imageId &&
-            item.state === 'done' &&
-            item.type === 'image' &&
-            'imageUrl' in item &&
-            !!item.imageUrl,
-        )
-        if (completed) {
+      const cleanup = () => {
+        if (timeout) {
           clearTimeout(timeout)
-          resolve({
-            images: [
-              {
-                id: completed.id,
-                type: 'image' as const,
-                imageUrl: (completed as { imageUrl: string }).imageUrl,
-                mode: 'imageEdit' as const,
-                settings: completed.settings || {},
-              },
-            ],
-          })
+          timeout = null
+        }
+        if (stopWatcher) {
+          stopWatcher()
+          stopWatcher = null
         }
       }
 
-      checkCompletion()
-      const stopWatcher = watch(() => imageGeneration.generatedImages, checkCompletion, {
-        deep: true,
-      })
-      setTimeout(() => stopWatcher(), 300000)
+      // (Re)arm the idle watchdog. Called on every progress signal so the timer
+      // only elapses after a true stall, letting slow renders run to completion.
+      const armIdleTimeout = () => {
+        if (timeout) clearTimeout(timeout)
+        timeout = setTimeout(() => {
+          cleanup()
+          resolve(createErrorResult('Image edit stalled (no progress for 5 minutes)'))
+        }, GENERATION_IDLE_TIMEOUT_MS)
+      }
+
+      const check = () => {
+        const tracked = imageGeneration.generatedImages.find((item) => item.id === imageId)
+        // Failure / cancellation — resolve with an error instead of hanging.
+        if (
+          imageGeneration.currentState === 'error' ||
+          tracked?.state === 'failed' ||
+          tracked?.state === 'stopped'
+        ) {
+          cleanup()
+          resolve(
+            createErrorResult(`Image edit failed: ${imageGeneration.lastError ?? 'unknown error'}`),
+          )
+          return
+        }
+
+        const completed =
+          tracked &&
+          tracked.state === 'done' &&
+          ((tracked.type === 'image' && 'imageUrl' in tracked && !!tracked.imageUrl) ||
+            (tracked.type === 'video' && 'videoUrl' in tracked && !!tracked.videoUrl) ||
+            (tracked.type === 'model3d' && 'model3dUrl' in tracked && !!tracked.model3dUrl))
+            ? tracked
+            : undefined
+        if (completed) {
+          cleanup()
+          const settings = completed.settings || {}
+          if (completed.type === 'video') {
+            resolve({
+              images: [
+                {
+                  id: completed.id,
+                  type: 'video',
+                  videoUrl: completed.videoUrl,
+                  mode: 'imageEdit',
+                  settings,
+                },
+              ],
+            })
+          } else if (completed.type === 'model3d') {
+            resolve({
+              images: [
+                {
+                  id: completed.id,
+                  type: 'model3d',
+                  model3dUrl: completed.model3dUrl,
+                  mode: 'imageEdit',
+                  settings,
+                },
+              ],
+            })
+          } else {
+            resolve({
+              images: [
+                {
+                  id: completed.id,
+                  type: 'image',
+                  imageUrl: completed.imageUrl,
+                  mode: 'imageEdit',
+                  settings,
+                },
+              ],
+            })
+          }
+        }
+      }
+
+      armIdleTimeout()
+      stopWatcher = watch(
+        () => [
+          imageGeneration.generatedImages,
+          imageGeneration.currentState,
+          imageGeneration.stepText,
+        ],
+        () => {
+          armIdleTimeout()
+          check()
+        },
+        { deep: true },
+      )
+      check()
     })
 
     return result
@@ -409,30 +510,114 @@ export async function executeImageEdit(
         (i) => i.id !== imageId,
       )
     }
+    // A user cancelling a required model download is not a tool failure — report
+    // it back to the model as a benign cancellation (the finally still cleans up).
+    if (isCancellation(error)) {
+      return {
+        success: false,
+        message: 'Image edit was cancelled by the user.',
+        images: [],
+      }
+    }
     return createErrorResult(
       `Image edit failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
     )
   } finally {
+    // Keep the activity alive through cleanup (GPU free + chat backend restart) so
+    // the window before the LLM's final response isn't silent.
     await restoreState()
     if (!useDeveloperSettings().keepModelsLoaded) {
+      activities.update(toolActivityId, { label: i18nState.COM_ACTIVITY_RELOADING_CHAT })
       await comfyUi.free()
       await restartChatBackend()
     }
+    finishToolActivity()
   }
+}
+
+// User-selectable defaults, resolved per output media type from the enabled edit
+// presets. Standalone, explicitly-typed helpers keep the heavy `useTextInference()`
+// store type out of `getToolDefinition` (whose inferred shape feeds the ai-SDK
+// `tool()` generics), avoiding a type-instantiation blow-up.
+function resolveDefaultEditWorkflow(imageNames: string[]): string {
+  return (
+    useTextInference().getDefaultWorkflow('comfyUiImageEdit:image', imageNames) ?? 'Edit By Prompt'
+  )
+}
+
+/**
+ * Repair a malformed comfyUiImageEdit tool call before execution: if the model
+ * omitted `workflow` or sent a value that isn't a known edit workflow, coerce it
+ * to the default edit workflow. Returns the repaired args as a JSON string, or
+ * null when `workflow` is already valid (nothing to fix) or none exist. Wired
+ * into streamText's experimental_repairToolCall so a bad workflow can't surface
+ * as an "unknown" tool card / failed edit.
+ */
+export function repairEditToolInput(rawInput: string): string | null {
+  const workflows = getAvailableEditWorkflows()
+  if (workflows.length === 0) return null
+  let obj: Record<string, unknown>
+  try {
+    const parsed: unknown = JSON.parse(rawInput || '{}')
+    obj = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
+  } catch {
+    obj = {}
+  }
+  const names = workflows.map((w) => w.name)
+  if (typeof obj.workflow === 'string' && names.includes(obj.workflow)) return null
+  const imageNames = workflows
+    .filter((w) => (w.mediaType ?? 'image') === 'image')
+    .map((w) => w.name)
+  obj.workflow = resolveDefaultEditWorkflow(imageNames)
+  return JSON.stringify(obj)
+}
+
+function resolveDefaultAnimateWorkflow(videoNames: string[]): string | null {
+  return useTextInference().getDefaultWorkflow('comfyUiImageEdit:video', videoNames)
+}
+
+function resolveDefaultTo3DWorkflow(modelNames: string[]): string | null {
+  return useTextInference().getDefaultWorkflow('comfyUiImageEdit:model3d', modelNames)
 }
 
 function getToolDefinition() {
   const workflows = getAvailableEditWorkflows()
-  const defaultWorkflow = 'Edit By Prompt'
+
+  const imageNames = workflows
+    .filter((w) => (w.mediaType ?? 'image') === 'image')
+    .map((w) => w.name)
+  const videoNames = workflows.filter((w) => w.mediaType === 'video').map((w) => w.name)
+  const modelNames = workflows.filter((w) => w.mediaType === 'model3d').map((w) => w.name)
+  const defaultEditWorkflow = resolveDefaultEditWorkflow(imageNames)
+  const defaultAnimateWorkflow = resolveDefaultAnimateWorkflow(videoNames)
+  const defaultTo3DWorkflow = resolveDefaultTo3DWorkflow(modelNames)
+
   const workflowOptions = workflows
-    .map((w) => w.name + (w.name === defaultWorkflow ? ' (default)' : ''))
+    .map((w) => {
+      const mediaTypeStr = w.mediaType && w.mediaType !== 'image' ? ` (${w.mediaType})` : ''
+      let isDefault = ''
+      if (w.name === defaultEditWorkflow) isDefault = ' (default)'
+      else if (w.name === defaultAnimateWorkflow) isDefault = ' (default animate)'
+      else if (w.name === defaultTo3DWorkflow) isDefault = ' (default 3D)'
+      return w.name + mediaTypeStr + isDefault
+    })
     .join(', ')
 
+  const videoWorkflows = workflows.filter((w) => w.mediaType === 'video')
+
   let description =
-    'Use this tool to edit or modify an existing image from the conversation based on a text prompt. ' +
-    'This tool takes the most recent image from the conversation (uploaded or generated) and applies edits.\n\n' +
+    'Use this tool to transform an existing image from the conversation based on a text prompt. ' +
+    'This tool takes the most recent image from the conversation (uploaded or generated) and applies the selected workflow - editing it, converting it to a 3D model, or animating it into a video.\n\n' +
     'IMPORTANT: This tool requires an image to already exist in the conversation.\n\n' +
     'VARIANT SUPPORT: Presets may have variants (e.g., "Fast", "Standard", "Quality"). By default, always prefer "Fast" variants when available as they are least resource intensive.\n\n'
+
+  if (videoWorkflows.length > 0) {
+    description += `IMAGE-TO-VIDEO: Workflows (${videoWorkflows
+      .map((w) => w.name)
+      .join(
+        ', ',
+      )}) animate the existing image into a short video. Only use them when the user explicitly asks to animate an image or create a video from it. Video generation is resource-intensive.\n\n`
+  }
 
   // Add preset-specific tool instructions with clear preset -> instruction mapping
   const presetsWithInstructions = workflows.filter((w) => w.toolInstructions)
@@ -444,18 +629,32 @@ function getToolDefinition() {
     description += '\n'
   }
 
+  // Per-output-type defaults: what to reach for unless the user asks otherwise.
+  description += `DEFAULTS: For editing an image, default to "${defaultEditWorkflow}".`
+  if (defaultAnimateWorkflow) {
+    description += ` To animate an image into a video, default to "${defaultAnimateWorkflow}".`
+  }
+  if (defaultTo3DWorkflow) {
+    description += ` To convert an image into a 3D model, default to "${defaultTo3DWorkflow}".`
+  }
+  description += '\n\n'
+
   description += `Available edit workflows: ${workflowOptions}`
 
   const workflowNames = workflows.map((w) => w.name) as [string, ...string[]]
 
+  let workflowDescription = `Edit workflow to use. Available: ${workflowOptions}. Use "${defaultEditWorkflow}" for image edits unless the user explicitly requests a different workflow.`
+  if (defaultAnimateWorkflow) {
+    workflowDescription += ` Use "${defaultAnimateWorkflow}" when animating an image into a video.`
+  }
+  if (defaultTo3DWorkflow) {
+    workflowDescription += ` Use "${defaultTo3DWorkflow}" when converting an image into a 3D model.`
+  }
+
   return {
     description,
     inputSchema: z.object({
-      workflow: z
-        .enum(workflowNames)
-        .describe(
-          `Edit workflow to use. Available: ${workflowOptions}. Use "${defaultWorkflow}" unless the user explicitly requests a different workflow.`,
-        ),
+      workflow: z.enum(workflowNames).describe(workflowDescription),
       variant: z
         .string()
         .optional()

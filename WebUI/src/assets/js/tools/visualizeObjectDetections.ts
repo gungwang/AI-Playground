@@ -4,7 +4,7 @@ import { z } from 'zod'
 // Type for detection data
 type Detection = {
   label: string
-  location: [number, number, number, number] // [x1, y1, x2, y2]
+  location: number[] // [x1, y1, x2, y2] — validated to length 4 at runtime
 }
 
 /**
@@ -190,17 +190,20 @@ export async function executeVisualizeObjectDetections(
   },
   messages: ModelMessage[],
 ): Promise<{ annotatedImageUrl: string }> {
+  const safeMessages = messages ?? []
+  const detections = args.detections ?? []
+
   console.log('[visualizeObjectDetections] Tool execution started', {
-    detectionsCount: args.detections?.length ?? 0,
-    messagesCount: messages?.length ?? 0,
-    detections: args.detections,
+    detectionsCount: detections.length,
+    messagesCount: safeMessages.length,
+    detections,
   })
 
   try {
     // find latest image url from messages
     console.log('[visualizeObjectDetections] Searching for image in messages', {
-      messagesLength: messages.length,
-      messages: messages.map((msg) => ({
+      messagesLength: safeMessages.length,
+      messages: safeMessages.map((msg) => ({
         role: msg.role,
         contentType: typeof msg.content,
         contentLength: Array.isArray(msg.content) ? msg.content.length : 'N/A',
@@ -208,7 +211,7 @@ export async function executeVisualizeObjectDetections(
     })
 
     // Find the most recent image from any user message in the conversation
-    const imagePart = messages
+    const imagePart = safeMessages
       .filter((msg) => msg.role === 'user' && Array.isArray(msg.content))
       .flatMap((msg) => msg.content as Array<{ type: string; mediaType?: string }>)
       .findLast(
@@ -248,17 +251,17 @@ export async function executeVisualizeObjectDetections(
     }
 
     // Validate detections
-    if (!args.detections || args.detections.length === 0) {
+    if (detections.length === 0) {
       console.error('[visualizeObjectDetections] No detections provided')
       throw new Error('At least one detection is required')
     }
 
     console.log('[visualizeObjectDetections] Validating detections', {
-      detectionsCount: args.detections.length,
+      detectionsCount: detections.length,
     })
 
-    for (let i = 0; i < args.detections.length; i++) {
-      const detection = args.detections[i]
+    for (let i = 0; i < detections.length; i++) {
+      const detection = detections[i]
       console.log(`[visualizeObjectDetections] Validating detection ${i}`, {
         detection,
         hasLabel: !!detection.label,
@@ -286,10 +289,10 @@ export async function executeVisualizeObjectDetections(
 
     console.log('[visualizeObjectDetections] Starting image annotation', {
       imageUrl,
-      detectionsCount: args.detections.length,
+      detectionsCount: detections.length,
     })
 
-    const annotatedImageUrl = await drawDetectionsOnImage(imageUrl, args.detections)
+    const annotatedImageUrl = await drawDetectionsOnImage(imageUrl, detections)
 
     console.log('[visualizeObjectDetections] Image annotation completed', {
       annotatedImageUrlLength: annotatedImageUrl?.length ?? 0,
@@ -319,7 +322,13 @@ export const visualizeObjectDetections = tool({
         z.object({
           label: z.string().describe('Label/name of the detected object'),
           location: z
-            .tuple([z.number(), z.number(), z.number(), z.number()])
+            // A fixed-length array (not z.tuple): tuples compile to JSON Schema
+            // with `items` as an array of per-position schemas, which strict
+            // validators (Google Gemini's OpenAI-compatible endpoint) reject with
+            // "items must be a boolean or an object". `.length(4)` emits a single
+            // `items` schema plus min/maxItems, which every provider accepts.
+            .array(z.number())
+            .length(4)
             .describe(
               'Bounding box coordinates as [x1, y1, x2, y2] where (x1, y1) is top-left and (x2, y2) is bottom-right',
             ),

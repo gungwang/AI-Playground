@@ -1,27 +1,61 @@
 import concurrent.futures
+import logging
 import os
 import queue
+import re
 import shutil
-import logging
 import time
 import traceback
-from os import path, makedirs, rename
-from threading import Thread, Lock
-from time import sleep
-from typing import Any, Callable, Dict, List
+from collections.abc import Callable
 from hashlib import sha256
+from os import makedirs, path, rename
+from threading import Lock, Thread
+from time import sleep
+from typing import Any
 
+import httpx
 import psutil
 import requests
-from huggingface_hub import HfFileSystem, hf_hub_url, model_info
-from psutil._common import bytes2human
-
 import utils
+from exceptions import DownloadException, HFReachabilityError
+from huggingface_hub import HfFileSystem, hf_hub_url, model_info
+from huggingface_hub.errors import HfHubHTTPError
+from psutil._common import bytes2human
 from utils import is_specific_file_reference
-from exceptions import DownloadException
+
+# Network/transient errors that mean "we could not reach HF", as opposed to a
+# definitive "does not exist". huggingface_hub uses httpx for its HTTP calls
+# (hence httpx.HTTPError covers read/connect timeouts); requests is kept for
+# any legacy code path, and HfHubHTTPError covers transient upstream 5xx/429.
+_HF_TRANSIENT_ERRORS = (
+    httpx.HTTPError,
+    requests.exceptions.RequestException,
+    HfHubHTTPError,
+)
+_HF_EXISTS_RETRIES = 3
 
 model_list_cache = dict()
 model_lock = Lock()
+
+
+def _merge_move(src: str, dst: str) -> None:
+    """Move `src` to `dst`, merging into an existing destination directory tree.
+
+    Plain `shutil.move` raises `shutil.Error: Destination path '...' already exists`
+    when moving a directory whose name already exists at the destination. That happens
+    when two downloads from the same HF repo land files into the same subdirectory
+    (e.g. ERNIE-Image's `diffusion_models/turbo.safetensors` then `diffusion_models/main.safetensors`).
+    We recurse instead, replacing files at the leaves.
+    """
+    if os.path.isdir(src) and os.path.isdir(dst):
+        for item in os.listdir(src):
+            _merge_move(os.path.join(src, item), os.path.join(dst, item))
+        os.rmdir(src)
+        return
+    if os.path.isfile(dst):
+        os.remove(dst)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
 
 
 class HFFileItem:
@@ -59,9 +93,7 @@ class NotEnoughDiskSpaceException(Exception):
     def __init__(self, requires_space: int, free_space: int):
         self.requires_space = requires_space
         self.free_space = free_space
-        message = "Not enough disk space. It requires {}, but only {} of free space is available".format(
-            bytes2human(requires_space), bytes2human(free_space)
-        )
+        message = f"Not enough disk space. It requires {bytes2human(requires_space)}, but only {bytes2human(free_space)} of free space is available"
         super().__init__(message)
 
 
@@ -95,8 +127,32 @@ class HFPlaygroundDownloader:
         self.thread_lock = Lock()
         self.hf_token = hf_token
 
-    def hf_url_exists(self, repo_id: str):
-        return self.fs.exists(repo_id)
+    def hf_url_exists(self, repo_id: str) -> bool:
+        """Return whether the given HF repo/file exists.
+
+        `HfFileSystem.exists` already reports a genuinely missing repo/file as
+        ``False``; anything that escapes is a failure to *reach* the HF API
+        (read timeout, connection error, transient 5xx). Retry those a few
+        times, and if they persist raise `HFReachabilityError` so the caller
+        can distinguish "does not exist" from "could not check".
+        """
+        last_exc = None
+        for attempt in range(_HF_EXISTS_RETRIES):
+            try:
+                return self.fs.exists(repo_id)
+            except _HF_TRANSIENT_ERRORS as ex:
+                last_exc = ex
+                logging.warning(
+                    "checking existence of %s failed (attempt %d/%d): %s: %s",
+                    repo_id,
+                    attempt + 1,
+                    _HF_EXISTS_RETRIES,
+                    type(ex).__name__,
+                    ex,
+                )
+                if attempt + 1 < _HF_EXISTS_RETRIES:
+                    sleep(1 + attempt)
+        raise HFReachabilityError(repo_id, last_exc)
 
     def probe_type(self, repo_id: str):
         return model_info(utils.trim_repo(repo_id)).pipeline_tag
@@ -176,13 +232,20 @@ class HFPlaygroundDownloader:
                 )
 
     def enum_specific_file(
-        self, file_list: List, repo_id: str, model_type: str
+        self, file_list: list, repo_id: str, model_type: str
     ) -> bool:
         """
         Enumerate a specific file reference (e.g., namespace/repo/file.gguf).
-        Returns True if the specific file was successfully added, False otherwise.
+
+        When the referenced file is one shard of a split GGUF
+        (e.g. `model-00001-of-00003.gguf`), every sibling shard in the same folder
+        is enumerated so the whole model is downloaded, not just the single shard.
+        Returns True if at least one file was successfully added, False otherwise.
         """
         try:
+            if self.enum_split_gguf_shards(file_list, repo_id):
+                return True
+
             file_info = self.fs.info(repo_id)
             size = file_info.get("size", 0)
             self.total_size += size
@@ -199,8 +262,52 @@ class HFPlaygroundDownloader:
             print(f"Warning: Failed to get info for specific file {repo_id}: {e}")
             return False
 
+    def enum_split_gguf_shards(self, file_list: list, repo_id: str) -> bool:
+        """If repo_id points at one shard of a split GGUF, enumerate every shard.
+
+        Matches the standard llama.cpp split naming `*-NNNNN-of-NNNNN.gguf` and lists
+        the sibling shards in the same folder so the complete model is queued. Returns
+        True when shards were added, False otherwise (caller falls back to single-file
+        handling).
+        """
+        basename = path.basename(repo_id)
+        shard_match = re.search(r"-\d{5}-of-\d{5}\.gguf$", basename)
+        if not shard_match:
+            return False
+
+        folder = repo_id.rsplit("/", 1)[0]
+        prefix = basename[: shard_match.start()]
+        try:
+            entries = self.fs.ls(folder, detail=True)
+        except Exception as e:
+            print(f"Warning: Failed to list split GGUF folder {folder}: {e}")
+            return False
+
+        added = False
+        for item in entries:
+            if item.get("type") == "directory":
+                continue
+            name = item.get("name")
+            base = path.basename(name)
+            if not (
+                base.startswith(prefix) and re.search(r"-\d{5}-of-\d{5}\.gguf$", base)
+            ):
+                continue
+            size = item.get("size", 0)
+            self.total_size += size
+            relative_path = path.relpath(name, utils.trim_repo(repo_id))
+            subfolder = path.dirname(relative_path).replace("\\", "/")
+            filename = path.basename(relative_path)
+            url = hf_hub_url(
+                repo_id=utils.trim_repo(repo_id), subfolder=subfolder, filename=filename
+            )
+            file_list.append(HFFileItem(relative_path, size, url))
+            added = True
+
+        return added
+
     def populate_file_list(
-        self, file_list: List, repo_id: str, model_type: str
+        self, file_list: list, repo_id: str, model_type: str
     ) -> None:
         """
         Populate file list with either specific file or directory enumeration.
@@ -235,7 +342,7 @@ class HFPlaygroundDownloader:
             return item["size"]
 
     def enum_file_list(
-        self, file_list: List, enum_path: str, model_type: str, is_root=True
+        self, file_list: list, enum_path: str, model_type: str, is_root=True
     ):
         # repo = "/".join(enum_path.split("/")[:2])
         list = self.fs.ls(enum_path, detail=True)
@@ -285,7 +392,7 @@ class HFPlaygroundDownloader:
                 )
                 file_list.append(HFFileItem(relative_path, size, url))
 
-    def enum_sd_unet(self, file_list: List[str | Dict[str, Any]]):
+    def enum_sd_unet(self, file_list: list[str | dict[str, Any]]):
         cur_level = 0
         first_model = None
         model_levels = [(".fp32.", 3), (".fp16.", 2), ("", 1)]
@@ -306,6 +413,7 @@ class HFPlaygroundDownloader:
 
     def multiple_thread_download(self, thread_count: int):
         self.download_stop = False
+        report_thread = None
         if self.on_download_progress is not None:
             self.prev_sec_download_size = 0
             report_thread = self.start_report_download_progress()
@@ -325,18 +433,20 @@ class HFPlaygroundDownloader:
             self.on_download_completed(self.repo_id, self.error)
         if not self.download_stop and self.error is None:
             self.move_to_desired_position()
-        else:
-            # Download aborted
-            shutil.rmtree(self.save_path_tmp)
+        # On failure or user stop, keep save_path_tmp so partial files can resume later.
 
     def move_to_desired_position(self, retriable: bool = True):
         desired_repo_root_dir_name = os.path.join(
             self.save_path, utils.repo_local_root_dir_name(self.repo_id)
         )
         move_to_flat_structure = False
+        # face restore and insightface models must land as a single flat *file*
+        # named "<owner>---<repo>---<file>" so the reactor node can load them.
+        flatten_to_single_file = False
         # face restore and insightface model need to be in a flat structure to work with reactor node
         if "facerestore" in self.save_path or "insightface" in self.save_path:
             move_to_flat_structure = True
+            flatten_to_single_file = True
             desired_repo_root_dir_name = path.abspath(
                 path.join(self.save_path, self.repo_id.replace("/", "---"))
             )
@@ -349,10 +459,22 @@ class HFPlaygroundDownloader:
                 os.makedirs(desired_repo_root_dir_name)
         try:
             if os.path.exists(desired_repo_root_dir_name) or move_to_flat_structure:
+                if flatten_to_single_file:
+                    # The reactor node expects the flat name to be the file itself,
+                    # not a directory containing it. Clear any stale directory left
+                    # by an earlier (broken) download before moving the file into place.
+                    utils.remove_existing_filesystem_resource(
+                        desired_repo_root_dir_name
+                    )
                 for item in os.listdir(self.save_path_tmp):
-                    shutil.move(
+                    dst = (
+                        desired_repo_root_dir_name
+                        if flatten_to_single_file
+                        else os.path.join(desired_repo_root_dir_name, item)
+                    )
+                    _merge_move(
                         os.path.join(self.save_path_tmp, item),
-                        desired_repo_root_dir_name,
+                        dst,
                     )
                 shutil.rmtree(self.save_path_tmp)
             else:
@@ -438,8 +560,18 @@ class HFPlaygroundDownloader:
                 while True:
                     try:
                         response, fw = self.init_download(file)
-                        if response.status_code != 200:
-                            download_retry += 2  # we only want to retry once in case of non network errors
+                        code = response.status_code
+                        if file.disk_file_size > 0 and code == 416:
+                            response.close()
+                            fw.close()
+                            if path.getsize(file.save_filename) >= file.size:
+                                break
+                            download_retry += 2
+                            raise DownloadException(file.url)
+                        if not utils.hf_chunk_http_ok(code, file.disk_file_size):
+                            response.close()
+                            fw.close()
+                            download_retry += 2
                             raise DownloadException(file.url)
                         # start download file
                         with response:

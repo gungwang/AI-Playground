@@ -1,8 +1,10 @@
 import { ChildProcess, spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import path from 'node:path'
 import fs from 'fs'
 import * as filesystem from 'fs-extra'
 import { spawnProcessAsync } from './osProcessHelper.ts'
+import { restoreTreeWritePermissions } from './tools.ts'
 import {
   LongLivedPythonApiService,
   GitService,
@@ -26,11 +28,31 @@ import {
   type ComfyUiDepsMarker,
 } from './comfyUiRevision.ts'
 import { ProcessError } from './osProcessHelper.ts'
+import { killStaleProcessesByCommandLine } from './processLifecycle.ts'
 import { getMediaDir } from '../util.ts'
-import { cudaVisibleDevicesEnv, levelZeroDeviceSelectorEnv } from './deviceDetection.ts'
-import { BrowserWindow } from 'electron'
+import { packagedResourcesRoot, writableConfigRoot } from '../aipgRoot.ts'
+import {
+  clearLevelZeroRuntimeCache,
+  cudaVisibleDevicesEnv,
+  levelZeroDeviceSelectorEnv,
+  linuxHasIntelGpuPciDevice,
+  linuxHasLevelZeroRuntime,
+  normalizeDeviceUuid,
+  withSelectedDevice,
+} from './deviceDetection.ts'
+import { resolveDefaultDevice } from './defaultDeviceSelection.ts'
+import {
+  getMissingPackages,
+  hasAptGet,
+  hasPkexec,
+  parseAptMissingPackages,
+  resolvePackageList,
+  runPkexecInstall,
+  waitForTerminalInstall,
+} from './linuxPackageInstaller.ts'
+import { BrowserWindow, app, dialog } from 'electron'
 import { LocalSettings } from '../main.ts'
-import { downloadCustomNode } from './comfyuiTools.ts'
+import { downloadCustomNode, configureComfyUiManagerSecurityLevel } from './comfyuiTools.ts'
 import { getBundledComfyUiGitRefSync } from '../remoteUpdates.ts'
 type Device = Omit<InferenceDevice, 'selected'>
 
@@ -39,6 +61,150 @@ export type ComfyUiVariant = 'xpu' | 'cuda' | 'cpu'
 export const COMFYUI_DEFAULT_PARAMETERS = '--lowvram --reserve-vram 6.0'
 
 const UPSTREAM_PYPROJECT_BACKUP = 'pyproject.toml.aipg-upstream'
+
+// ---------------------------------------------------------------------------
+// Linux Intel-GPU runtime detection (XPU variant)
+// ---------------------------------------------------------------------------
+// Delegates to the shared, distro-robust + logged Level Zero detector so the
+// XPU vs CPU decision is consistent across backends and visible in the logs.
+function linuxHasIntelGpuRuntime(): boolean {
+  return linuxHasLevelZeroRuntime()
+}
+
+// Library-path entries prepended to LD_LIBRARY_PATH when the XPU variant is
+// active on Linux. Only existing directories are returned.
+function getLinuxOneApiLibPaths(): string[] {
+  const candidates = [
+    // Note: compiler/latest/lib is intentionally excluded — its libintelocl.so
+    // overrides the system ze_loader and breaks XPU device detection.
+    // libsycl is already bundled inside the ComfyUI venv.
+    '/opt/intel/oneapi/mkl/latest/lib',
+    '/opt/intel/oneapi/mkl/latest/lib/intel64',
+    '/opt/intel/oneapi/tbb/latest/lib',
+    '/opt/intel/oneapi/tbb/latest/lib/intel64/gcc4.8',
+    '/usr/lib/x86_64-linux-gnu',
+  ]
+  return candidates.filter((p) => fs.existsSync(p))
+}
+
+// ---------------------------------------------------------------------------
+// Linux Intel GPU system dependency installation (Level Zero / XPU)
+// ---------------------------------------------------------------------------
+// These packages are not in the standard Ubuntu archive; they come from
+// Intel's GPU repository (https://repositories.intel.com/gpu/ubuntu).
+// Package names differ between Ubuntu 22.04 (Jammy) and 24.04 (Noble).
+const LINUX_INTEL_GPU_ALT_PACKAGES: string[][] = [
+  // Level Zero ICD loader
+  ['libze1', 'level-zero'],
+  // Level Zero Intel GPU driver — the part that lets Level Zero enumerate the GPU.
+  // This is distinct from the loader: without it, libze_loader.so is present but
+  // torch.xpu.device_count() returns 0.
+  ['libze-intel-gpu1', 'intel-level-zero-gpu'],
+]
+// Always try to install alongside the Level Zero packages.
+const LINUX_INTEL_GPU_UNCONDITIONAL_PACKAGES: string[] = ['intel-opencl-icd']
+
+// Build toolchain required to set up ComfyUI on Linux: `git` clones the repo,
+// while `build-essential` (C/C++ compiler) and `python3-dev` (CPython headers)
+// are needed to compile source-only wheels such as insightface during uv sync.
+const LINUX_COMFYUI_BUILD_PACKAGES: string[] = ['git', 'build-essential', 'python3-dev']
+
+// Bash script run (as root via pkexec) before the apt-get install step.
+// Adds Intel's GPU repository if neither the Noble nor Jammy package names
+// are already available in apt. Safe to re-run (idempotent).
+const INTEL_GPU_APT_REPO_SCRIPT = `
+# Add Intel GPU repository if Level Zero packages are not yet in apt
+if ! apt-cache show libze1 >/dev/null 2>&1 && ! apt-cache show level-zero >/dev/null 2>&1; then
+  apt-get install -y --no-install-recommends ca-certificates gpg wget
+  wget -qO /tmp/intel-graphics.key https://repositories.intel.com/gpu/intel-graphics.key
+  gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg /tmp/intel-graphics.key
+  rm -f /tmp/intel-graphics.key
+  . /etc/os-release
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu \${VERSION_CODENAME} unified" > /etc/apt/sources.list.d/intel-gpu.list
+  apt-get update
+fi`.trim()
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+
+/**
+ * Returns the renderer Origin used for ComfyUI's --enable-cors-header. In
+ * dev the renderer runs on the Vite dev server origin; packaged builds load
+ * the renderer from `file://`, which the browser sends as `Origin: null`.
+ */
+function getRendererOrigin(): string {
+  if (!app.isPackaged) {
+    const devUrl = process.env['VITE_DEV_SERVER_URL']
+    if (devUrl) {
+      try {
+        const u = new URL(devUrl)
+        return `${u.protocol}//${u.host}`
+      } catch {
+        /* fall through */
+      }
+    }
+  }
+  return 'null'
+}
+
+/**
+ * Sanitize the user-supplied ComfyUI parameter string from settings so that
+ * malicious or accidental values cannot expand the attack surface:
+ *
+ * - drop any `--listen <addr>` / `--listen=<addr>` whose address is not a
+ *   loopback host (`127.0.0.1`, `localhost`, `::1`),
+ * - drop any `--enable-cors-header [origin]` user override (we always
+ *   re-append our locked-down origin after user params),
+ * - drop any flag value of `0.0.0.0`.
+ */
+export function sanitizeUserComfyUiParameters(raw: string, warn?: (msg: string) => void): string[] {
+  const tokens = raw.split(/\s+/).filter(Boolean)
+  const out: string[] = []
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]
+    // --listen=<value> form
+    if (t.startsWith('--listen=')) {
+      const value = t.slice('--listen='.length)
+      if (!LOOPBACK_HOSTS.has(value)) {
+        warn?.(`Refusing user-supplied --listen=${value}; only loopback addresses are allowed`)
+        continue
+      }
+      out.push(t)
+      continue
+    }
+    if (t === '--listen') {
+      const value = tokens[i + 1]
+      if (value === undefined || value.startsWith('--')) {
+        // bare --listen with no arg defaults to 0.0.0.0 in ComfyUI -> reject
+        warn?.('Refusing bare --listen; only loopback addresses are allowed')
+        continue
+      }
+      if (!LOOPBACK_HOSTS.has(value)) {
+        warn?.(`Refusing user-supplied --listen ${value}; only loopback addresses are allowed`)
+        i++ // skip the value too
+        continue
+      }
+      out.push(t, value)
+      i++
+      continue
+    }
+    // --enable-cors-header=<value> form
+    if (t.startsWith('--enable-cors-header=')) {
+      warn?.(`Dropping user-supplied ${t}; CORS origin is forced by AI Playground`)
+      continue
+    }
+    if (t === '--enable-cors-header') {
+      // Skip the optional origin arg if present (heuristic: next token doesn't start with --).
+      const next = tokens[i + 1]
+      warn?.('Dropping user-supplied --enable-cors-header; CORS origin is forced by AI Playground')
+      if (next !== undefined && !next.startsWith('--')) {
+        i++
+      }
+      continue
+    }
+    out.push(t)
+  }
+  return out
+}
 
 export class ComfyUiBackendService extends LongLivedPythonApiService {
   constructor(name: BackendServiceName, port: number, win: BrowserWindow, settings: LocalSettings) {
@@ -70,6 +236,24 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
   private comfyUiVariant: ComfyUiVariant = 'xpu'
   private variantMismatchToastSent = false
 
+  // Tri-state record of whether a torch.xpu device probe has positively
+  // confirmed at least one usable Intel GPU. `null` = not probed yet (or last
+  // probe never ran), `true` = >=1 usable XPU device, `false` = 0 devices.
+  // spawnAPIProcess() requires `true` before launching as the XPU variant, so a
+  // transient/stale `comfyUiVariant === 'xpu'` can never start a doomed XPU
+  // process on a machine whose GPU is not actually usable (e.g. Resizable BAR
+  // disabled -> device_count() == 0).
+  private usableXpuConfirmed: boolean | null = null
+
+  // Per-launch loopback auth token, regenerated on every spawn. Consumed by
+  // the bundled `aipg-auth` ComfyUI custom_node middleware which rejects any
+  // request without a matching Bearer header / ?token= query / session cookie.
+  private loopbackAuthToken: string = randomBytes(32).toString('hex')
+
+  getLoopbackAuthToken(): string {
+    return this.loopbackAuthToken
+  }
+
   private readonly variantMarkerPath = path.join(this.serviceDir, 'aipg-variant.json')
 
   private readInstalledVariant(): ComfyUiVariant | null {
@@ -92,6 +276,7 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
   private getDesiredVariant(): ComfyUiVariant {
     if (this.settings.productMode === 'nvidia') return 'cuda'
     if (process.platform === 'win32') return 'xpu'
+    if (process.platform === 'linux' && linuxHasIntelGpuRuntime()) return 'xpu'
     return 'cpu'
   }
 
@@ -100,6 +285,226 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
     const restored = this.readInstalledVariant()
     if (restored) return restored
     return this.getDesiredVariant()
+  }
+
+  /**
+   * On Linux: if an Intel GPU PCI device is present, ensure the Level Zero
+   * loader and GPU driver packages are installed. Without the GPU driver
+   * (libze-intel-gpu1 / intel-level-zero-gpu), torch.xpu.device_count()
+   * returns 0 even when the PCI device is visible, causing ComfyUI to crash.
+   *
+   * Uses the same pkexec / terminal-emulator pattern as OpenVINO's dependency
+   * installer. Clears the cached Level Zero detection result after a successful
+   * install so the next call to linuxHasLevelZeroRuntime() picks up the new state.
+   */
+  private async ensureLinuxIntelGpuDependencies(
+    onProgress?: (message: string) => Promise<void> | void,
+  ): Promise<void> {
+    if (process.platform !== 'linux') return
+    if (!linuxHasIntelGpuPciDevice()) return
+
+    const hasApt = await hasAptGet()
+    if (!hasApt) {
+      this.appLogger.warn(
+        'apt-get not found; skipping automatic Intel GPU (Level Zero) dependency install',
+        this.name,
+      )
+      return
+    }
+
+    const packageList = await resolvePackageList(
+      LINUX_INTEL_GPU_ALT_PACKAGES,
+      LINUX_INTEL_GPU_UNCONDITIONAL_PACKAGES,
+    )
+    const missingPackages = await getMissingPackages(packageList)
+
+    if (missingPackages.length === 0) {
+      this.appLogger.info('Intel GPU (Level Zero) Linux packages are already installed', this.name)
+      return
+    }
+
+    this.appLogger.info(
+      `Intel GPU packages missing: ${missingPackages.join(', ')}`,
+      this.name,
+      true,
+    )
+
+    const packageListText = missingPackages.map((p) => `- ${p}`).join('\n')
+    const { response } = await dialog.showMessageBox(this.win, {
+      type: 'warning',
+      buttons: ['Install now', 'Cancel setup'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Install Intel GPU drivers',
+      message: 'ComfyUI requires Intel GPU (Level Zero) packages before it can use the XPU.',
+      detail:
+        `Missing packages:\n${packageListText}\n\n` +
+        'AI Playground will request administrator permission and install these packages automatically. ' +
+        'The Intel GPU repository will be added if it is not already configured.',
+    })
+
+    if (response === 1) {
+      this.appLogger.info(
+        'User cancelled Intel GPU dependency install; ComfyUI will run on CPU',
+        this.name,
+        true,
+      )
+      return
+    }
+
+    await onProgress?.('Installing Intel GPU (Level Zero) packages')
+
+    const pkexecAvailable = await hasPkexec()
+    let installSuccess = false
+
+    if (pkexecAvailable) {
+      const result = await runPkexecInstall(missingPackages, INTEL_GPU_APT_REPO_SCRIPT)
+      installSuccess = result.success
+      if (!result.success) {
+        const aptMissing = parseAptMissingPackages(result.output)
+        if (aptMissing.length > 0) {
+          this.appLogger.error(
+            `Intel GPU install failed. Packages not found in apt: ${aptMissing.join(', ')}. ` +
+              'Check that the Intel GPU repository is reachable.',
+            this.name,
+            true,
+          )
+        } else {
+          this.appLogger.error(`Intel GPU install failed: ${result.output}`, this.name, true)
+        }
+      }
+    } else {
+      await onProgress?.('pkexec unavailable, falling back to terminal installer')
+      installSuccess = await waitForTerminalInstall(missingPackages, INTEL_GPU_APT_REPO_SCRIPT)
+      if (installSuccess) {
+        // Give apt a moment to register the newly installed packages
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+      }
+    }
+
+    if (installSuccess) {
+      // Invalidate the cached Level Zero detection so getDesiredVariant() picks
+      // up the newly installed GPU driver on the next call.
+      clearLevelZeroRuntimeCache()
+      this.appLogger.info(
+        'Intel GPU packages installed successfully; Level Zero cache cleared',
+        this.name,
+        true,
+      )
+    }
+  }
+
+  /**
+   * On Linux: ensure the build toolchain required to set up ComfyUI is present.
+   * A fresh Ubuntu lacks `git` (needed to clone ComfyUI) and the C compiler /
+   * Python headers (`build-essential`, `python3-dev`) needed to build source-only
+   * wheels such as insightface during `uv sync`. Without these, setup fails with
+   * a confusing `git clone` error or a wheel compilation error.
+   *
+   * Unlike the Intel GPU step (which falls back to CPU on cancel), these packages
+   * are MANDATORY: setup cannot succeed without them, so cancelling or a failed
+   * install throws. Uses the same pkexec / terminal-emulator pattern as OpenVINO.
+   */
+  private async ensureLinuxBuildDependencies(
+    onProgress?: (message: string) => Promise<void> | void,
+  ): Promise<void> {
+    if (process.platform !== 'linux') return
+
+    const hasApt = await hasAptGet()
+    if (!hasApt) {
+      this.appLogger.warn(
+        'apt-get not found; skipping automatic ComfyUI build dependency install',
+        this.name,
+      )
+      return
+    }
+
+    const missingPackages = await getMissingPackages(LINUX_COMFYUI_BUILD_PACKAGES)
+
+    if (missingPackages.length === 0) {
+      this.appLogger.info('ComfyUI Linux build dependencies are already installed', this.name)
+      return
+    }
+
+    this.appLogger.info(
+      `ComfyUI build packages missing: ${missingPackages.join(', ')}`,
+      this.name,
+      true,
+    )
+
+    const packageListText = missingPackages.map((p) => `- ${p}`).join('\n')
+    const { response } = await dialog.showMessageBox(this.win, {
+      type: 'warning',
+      buttons: ['Install now', 'Cancel setup'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Install ComfyUI Linux dependencies',
+      message: 'ComfyUI requires additional Ubuntu packages before setup can continue.',
+      detail:
+        `Missing packages:\n${packageListText}\n\n` +
+        'AI Playground will request administrator permission and install these packages automatically.',
+    })
+
+    if (response === 1) {
+      throw new Error('ComfyUI setup canceled: Linux build dependencies were not installed')
+    }
+
+    await onProgress?.('Installing Ubuntu build dependencies for ComfyUI')
+
+    const pkexecAvailable = await hasPkexec()
+    if (pkexecAvailable) {
+      const installResult = await runPkexecInstall(missingPackages, 'apt-get update')
+      if (!installResult.success) {
+        const aptMissing = parseAptMissingPackages(installResult.output)
+        if (aptMissing.length > 0) {
+          this.appLogger.error(
+            `ComfyUI dependency install failed. Missing in apt repo: ${aptMissing.join(', ')}`,
+            this.name,
+            true,
+          )
+        } else {
+          this.appLogger.error(
+            `ComfyUI dependency install failed with output: ${installResult.output}`,
+            this.name,
+            true,
+          )
+        }
+      }
+    } else {
+      await onProgress?.('pkexec unavailable, falling back to terminal installer')
+      const terminalExited = await waitForTerminalInstall(missingPackages, 'sudo apt-get update')
+      if (!terminalExited) {
+        throw new Error(
+          `Could not open installer automatically. Please install: ${missingPackages.join(', ')}`,
+        )
+      }
+      this.appLogger.info('Terminal closed. Waiting for apt-cache refresh...', this.name)
+      await new Promise((resolve) => setTimeout(resolve, 3000))
+    }
+
+    let stillMissing: string[] = []
+    for (let retryAttempt = 0; retryAttempt < 5; retryAttempt++) {
+      stillMissing = await getMissingPackages(LINUX_COMFYUI_BUILD_PACKAGES)
+      if (stillMissing.length === 0) {
+        this.appLogger.info('Installed missing Linux build dependencies for ComfyUI', this.name)
+        return
+      }
+      if (retryAttempt < 4) {
+        this.appLogger.info(
+          `Still missing on attempt ${retryAttempt + 1}: ${stillMissing.join(', ')}. Retrying...`,
+          this.name,
+        )
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
+    }
+
+    this.appLogger.error(
+      `ComfyUI build dependencies still missing after installer: ${stillMissing.join(', ')}`,
+      this.name,
+      true,
+    )
+
+    throw new Error(`Dependencies still missing after installer: ${stillMissing.join(', ')}`)
   }
 
   async serviceIsSetUp(): Promise<boolean> {
@@ -152,6 +557,10 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
         this.serviceFolder,
         this.pythonEnvDir,
         skipLockfileCheck ? { skipLockfileCheck: true } : undefined,
+        // Check against the same uv extra the backend was installed with
+        // (xpu/cuda/cpu). Without it uv resolves the base deps (generic torch →
+        // CUDA index on Linux) and reports a spurious xpu→cuda mismatch.
+        this.getEffectiveVariant(),
       )
 
       // If venv doesn't exist, service is not set up
@@ -227,21 +636,13 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
   async getCurrentVersion(): Promise<string | undefined> {
     try {
       try {
-        const tag = await this.git.run(
-          ['-C', this.serviceDir, 'describe', '--tags', '--exact-match'],
-          {},
-          this.serviceDir,
-        )
+        const tag = await this.gitRun(['describe', '--tags', '--exact-match'])
         const t = tag.trim()
         if (t) return normalizeComfyUiRef(t)
       } catch {
         /* not exactly on a tag */
       }
-      const hash = await this.git.run(
-        ['-C', this.serviceDir, 'rev-parse', '--short', 'HEAD'],
-        {},
-        this.serviceDir,
-      )
+      const hash = await this.gitRun(['rev-parse', '--short', 'HEAD'])
       return normalizeComfyUiRef(hash.trim())
     } catch (e) {
       this.appLogger.error(`failed to get comfyUI version: ${e}`, this.name)
@@ -290,18 +691,65 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
     await fs.promises.writeFile(markerPath, JSON.stringify(marker, null, 2), 'utf-8')
   }
 
+  // Every ComfyUI git command runs against its own checkout: `-C serviceDir` plus
+  // serviceDir as the working directory. This collapses that repeated boilerplate.
+  private gitRun(args: string[]): Promise<string> {
+    return this.git.run(['-C', this.serviceDir, ...args], {}, this.serviceDir)
+  }
+
+  // True only if `serviceDir` is the top level of its OWN git repository.
+  // This is the critical safety check: `git -C <dir>` walks upward to find a
+  // `.git`, so if ComfyUI's own `.git` is missing or broken (e.g. an empty
+  // leftover directory), git resolves to the parent AI-Playground repo and any
+  // mutating command (fetch/checkout) would corrupt it. An `existsSync('.git')`
+  // check is NOT sufficient — an empty `.git` dir passes it but is not a repo.
+  private async isOwnGitRepo(): Promise<boolean> {
+    try {
+      const top = (await this.gitRun(['rev-parse', '--show-toplevel'])).trim()
+      const norm = (p: string) =>
+        process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p)
+      return norm(top) === norm(this.serviceDir)
+    } catch {
+      return false
+    }
+  }
+
+  // Switch an existing ComfyUI checkout to `requested` in place (fetch + checkout)
+  // instead of deleting and re-cloning. Deletion is fragile on Windows (locked
+  // files from a loaded .venv, IDE indexing, read-only .git objects) and was the
+  // source of repeated EPERM failures; an in-place update touches only tracked
+  // files and never removes the directory.
+  private async updateExistingCheckout(requested: string): Promise<boolean> {
+    // Hard safety gate: never run mutating git unless this dir is its own repo.
+    if (!(await this.isOwnGitRepo())) {
+      return false
+    }
+    try {
+      // Fetch from the canonical HTTPS URL rather than the `origin` remote: an
+      // existing checkout's origin may be configured as SSH (git@github.com:...),
+      // which fails with "Permission denied (publickey)" in this environment.
+      await this.gitRun(['fetch', '--force', '--tags', this.remoteUrl])
+      try {
+        // Best effort: also fetch the ref directly (covers branches/commits not
+        // reachable via tags). Tags already arrived above, so ignore failures.
+        await this.gitRun(['fetch', '--force', this.remoteUrl, requested])
+      } catch {
+        /* ignore */
+      }
+      // --force discards local changes to tracked files (e.g. pyproject.toml edited
+      // by ComfyUI-Manager) so the checkout cannot be blocked.
+      await this.gitRun(['checkout', '--force', requested])
+      return await this.checkoutMatchesRevision(requested)
+    } catch (e) {
+      this.appLogger.info(`in-place ComfyUI update to ${requested} failed: ${e}`, this.name)
+      return false
+    }
+  }
+
   private async checkoutMatchesRevision(requested: string): Promise<boolean> {
     try {
-      const want = (
-        await this.git.run(
-          ['-C', this.serviceDir, 'rev-parse', `${requested}^{commit}`],
-          {},
-          this.serviceDir,
-        )
-      ).trim()
-      const head = (
-        await this.git.run(['-C', this.serviceDir, 'rev-parse', 'HEAD'], {}, this.serviceDir)
-      ).trim()
+      const want = (await this.gitRun(['rev-parse', `${requested}^{commit}`])).trim()
+      const head = (await this.gitRun(['rev-parse', 'HEAD'])).trim()
       return want.toLowerCase() === head.toLowerCase()
     } catch {
       return false
@@ -310,20 +758,12 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
 
   private async restoreComfyUiPyprojectAndLockFromHead(): Promise<void> {
     try {
-      await this.git.run(
-        ['-C', this.serviceDir, 'checkout', 'HEAD', '--', 'pyproject.toml'],
-        {},
-        this.serviceDir,
-      )
+      await this.gitRun(['checkout', 'HEAD', '--', 'pyproject.toml'])
     } catch {
       this.appLogger.info('restore pyproject.toml from HEAD skipped (missing or failed)', this.name)
     }
     try {
-      await this.git.run(
-        ['-C', this.serviceDir, 'checkout', 'HEAD', '--', 'uv.lock'],
-        {},
-        this.serviceDir,
-      )
+      await this.gitRun(['checkout', 'HEAD', '--', 'uv.lock'])
     } catch {
       this.appLogger.info('restore uv.lock from HEAD skipped (missing or failed)', this.name)
     }
@@ -447,6 +887,29 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
     this.appLogger.info('setting up service', this.name)
     this.setStatus('installing')
 
+    // Install Level Zero packages before variant detection so that
+    // getEffectiveVariant() → linuxHasLevelZeroRuntime() sees them.
+    if (process.platform === 'linux') {
+      yield {
+        serviceName: this.name,
+        step: 'linux dependencies',
+        status: 'executing',
+        debugMessage: 'checking and installing ComfyUI build dependencies',
+      }
+      // git + build toolchain must exist before the clone and before uv sync
+      // builds source-only wheels (insightface); this is mandatory and throws
+      // on cancel/failure.
+      await this.ensureLinuxBuildDependencies((msg) => this.appLogger.info(msg, this.name))
+
+      yield {
+        serviceName: this.name,
+        step: 'linux dependencies',
+        status: 'executing',
+        debugMessage: 'checking and installing Intel GPU (Level Zero) packages',
+      }
+      await this.ensureLinuxIntelGpuDependencies((msg) => this.appLogger.info(msg, this.name))
+    }
+
     this.comfyUiVariant = this.getEffectiveVariant()
 
     const checkServiceDir = async (): Promise<boolean> => {
@@ -454,24 +917,65 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
         return false
       }
 
-      try {
-        const matches = await this.checkoutMatchesRevision(this.revision)
-        if (matches) {
-          this.appLogger.info('comfyUI already cloned at requested revision, skipping', this.name)
+      // Preferred path: the directory is its own git repo, so update it in place
+      // (no deletion → no EPERM from locked .venv DLLs / IDE indexing / read-only
+      // .git objects). This is also the only path that mutates git, and it is
+      // gated on isOwnGitRepo() so it can never touch the parent AI-Playground repo.
+      if (await this.isOwnGitRepo()) {
+        if (await this.checkoutMatchesRevision(this.revision)) {
+          this.appLogger.info('comfyUI already at requested revision, skipping', this.name)
           return true
         }
         this.appLogger.info(
-          `ComfyUI checkout does not match requested revision ${this.revision}. Removing...`,
+          `Updating ComfyUI checkout to requested revision ${this.revision} in place`,
           this.name,
         )
-        throw new Error('Version mismatch')
-      } catch (_e) {
+        if (await this.updateExistingCheckout(this.revision)) {
+          this.appLogger.info(`comfyUI updated to ${this.revision} in place`, this.name)
+          return true
+        }
+        this.appLogger.warn(
+          'In-place ComfyUI update failed; falling back to remove + fresh clone',
+          this.name,
+        )
+      } else {
+        this.appLogger.warn(
+          `ComfyUI directory ${this.serviceDir} is not its own git repository; removing for a fresh clone`,
+          this.name,
+        )
+      }
+
+      // Fallback: wipe the directory so the caller re-clones. Retry a few times —
+      // after the backend process is killed Windows can take a moment to release
+      // directory handles. Surface a clear, actionable error if it ultimately
+      // cannot be removed rather than letting `git clone` fail later with a
+      // confusing "destination path already exists" message.
+      // On Linux/macOS a read-only directory in the tree fails removal with EACCES
+      // (unlink/rmdir needs write permission on the parent); strip the read-only
+      // bit up front, and again on EACCES, so the wipe-and-reclone path works.
+      await restoreTreeWritePermissions(this.serviceDir)
+      let lastError: unknown
+      for (let attempt = 0; attempt < 5; attempt++) {
         try {
           filesystem.removeSync(this.serviceDir)
-        } finally {
-          return false
+          lastError = undefined
+          break
+        } catch (removeError) {
+          lastError = removeError
+          if ((removeError as NodeJS.ErrnoException)?.code === 'EACCES') {
+            await restoreTreeWritePermissions(this.serviceDir)
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1000))
         }
       }
+      if (lastError) {
+        throw new Error(
+          `Failed to remove existing ComfyUI directory ${this.serviceDir} for reinstall. ` +
+            `Close any program holding files there (a running ComfyUI, an IDE indexing the ` +
+            `folder, or a terminal/Explorer window inside it) and try again. Cause: ${lastError}`,
+        )
+      }
+      return false
     }
 
     const setupComfyUiBaseService = async (): Promise<void> => {
@@ -480,7 +984,7 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
         this.appLogger.info('comfyUI already cloned, skipping', this.name)
       } else {
         await this.git.run(['clone', this.remoteUrl, this.serviceDir])
-        await this.git.run(['-C', this.serviceDir, 'checkout', this.revision], {}, this.serviceDir)
+        await this.gitRun(['checkout', this.revision])
       }
 
       const comfyUIDepsDir = path.join(aipgBaseDir, 'comfyui-deps')
@@ -505,7 +1009,7 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
         let needsInstall = true
         if (existingMarker?.mode === 'locked' && markerMatches && !variantChanged) {
           try {
-            await checkBackend(this.serviceFolder)
+            await checkBackend(this.serviceFolder, this.comfyUiVariant)
             needsInstall = false
             this.appLogger.info('ComfyUI locked deps already synced, skipping', this.name)
           } catch {
@@ -572,11 +1076,20 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
       try {
         if (this.comfyUiVariant === 'xpu') {
           this.appLogger.info('patching hijacks into comfyUI model_management (xpu)', this.name)
-          patchFile(
-            path.join(this.serviceDir, 'comfy/model_management.py'),
-            'from comfy.model_management import get_model',
-            ['from ipex_to_cuda import ipex_init', 'ipex_init()'],
-          )
+          try {
+            await patchFile(
+              path.join(this.serviceDir, 'comfy/model_management.py'),
+              'from comfy.model_management import get_model',
+              ['from ipex_to_cuda import ipex_init', 'ipex_init()'],
+            )
+          } catch (patchErr) {
+            // Newer ComfyUI / torch+xpu versions don't need the ipex_to_cuda
+            // bridge (and may not contain the anchor line). Don't fail setup.
+            this.appLogger.info(
+              `ipex_to_cuda patch skipped (not applicable to this ComfyUI version): ${patchErr}`,
+              this.name,
+            )
+          }
         } else {
           // If a previous install injected ipex_to_cuda, remove it for non-XPU variants.
           const mmPath = path.join(this.serviceDir, 'comfy/model_management.py')
@@ -792,6 +1305,12 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
           extraEnv: this.getTorchBackendEnv(),
           skipExtraWheels: this.comfyUiVariant !== 'xpu',
         })
+        // Lock Manager down to security_level=strong so that even an attacker
+        // who reaches ComfyUI's loopback port cannot use the Manager API to
+        // install arbitrary git-URL custom nodes / pip packages — the same
+        // RCE primitive demonstrated in the CWE-494 report against the
+        // ai-backend's deleted /api/comfyUi/loadCustomNodes endpoint.
+        await configureComfyUiManagerSecurityLevel(this.serviceDir, 'strong')
         yield {
           serviceName: this.name,
           step: currentStep,
@@ -843,7 +1362,9 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
   private get torchBackendValue(): string {
     if (this.comfyUiVariant === 'cuda') return 'cu128'
     if (this.comfyUiVariant === 'cpu') return 'cpu'
-    return process.platform === 'win32' ? 'xpu' : 'cpu'
+    if (process.platform === 'win32') return 'xpu'
+    if (process.platform === 'linux' && linuxHasIntelGpuRuntime()) return 'xpu'
+    return 'cpu'
   }
 
   get comfyUiVariantName(): ComfyUiVariant {
@@ -855,17 +1376,43 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
   }
 
   private getCommonEnvVars(): Record<string, string> {
-    return {
-      PATH: `${path.join(this.pythonEnvDir, 'Library', 'bin')};${path.join(this.git.dir, 'cmd')};${process.env.PATH}`,
+    const envVars: Record<string, string> = {
+      PATH: [
+        // Windows: Conda Library/bin + bundled Git cmd directory.
+        // Linux/macOS: the venv's bin directory.
+        ...(process.platform === 'win32'
+          ? [path.join(this.pythonEnvDir, 'Library', 'bin'), path.join(this.git.dir, 'cmd')]
+          : [path.join(this.pythonEnvDir, 'bin')]),
+        process.env.PATH,
+      ].join(path.delimiter),
       PYTHONNOUSERSITE: 'true',
       SYCL_ENABLE_DEFAULT_CONTEXTS: '1',
       SYCL_CACHE_PERSISTENT: '1',
       PYTHONIOENCODING: 'utf-8',
       HF_ENDPOINT: this.settings.huggingfaceEndpoint,
-      PIP_CONFIG_FILE: 'nul',
+      AIPG_OPENVINO_IMAGE_MODELS: path.join(this.baseDir, 'models', 'openvino-image'),
+      PIP_CONFIG_FILE: process.platform === 'win32' ? 'nul' : '/dev/null',
       UV_NO_CONFIG: '1',
       UV_TORCH_BACKEND: this.torchBackendValue,
+      // Consumed by the bundled aipg-auth ComfyUI custom_node middleware.
+      AIPG_LOOPBACK_TOKEN: this.loopbackAuthToken,
     }
+
+    // On Linux with the XPU variant, expose the Intel oneAPI runtime libraries so
+    // IPEX can resolve libsycl.so / libmkl_sycl.so / libze_loader.so at runtime,
+    // and use the composite device hierarchy so Level Zero can make large
+    // contiguous USM allocations (fixes XPU OOM on shared-memory Intel iGPUs).
+    if (process.platform === 'linux' && this.comfyUiVariant === 'xpu') {
+      const oneApiLibPaths = getLinuxOneApiLibPaths()
+      if (oneApiLibPaths.length > 0) {
+        envVars.LD_LIBRARY_PATH = [...oneApiLibPaths, process.env.LD_LIBRARY_PATH ?? '']
+          .filter(Boolean)
+          .join(path.delimiter)
+      }
+      envVars.ZE_FLAT_DEVICE_HIERARCHY = 'COMPOSITE'
+    }
+
+    return envVars
   }
 
   private getDeviceSelectorEnv(): Record<string, string> {
@@ -926,9 +1473,15 @@ try:
     for i in range(device_count):
         try:
             device_name = torch.cuda.get_device_name(i)
-            print(f"{i}|{device_name}")
         except Exception:
-            print(f"{i}|Unknown Device")
+            device_name = "Unknown Device"
+        try:
+            # torch exposes the same GPU UUID as nvidia-smi (bare hex vs "GPU-"
+            # prefix); the TS side normalizes both so they compare equal.
+            uuid = str(getattr(torch.cuda.get_device_properties(i), "uuid", "") or "")
+        except Exception:
+            uuid = ""
+        print(f"{i}|{device_name}|{uuid}")
 except Exception as e:
     print(f"Error detecting CUDA devices: {str(e)}")
     sys.exit(1)
@@ -955,9 +1508,9 @@ except Exception as e:
           console.error(line)
           continue
         }
-        const parts = line.split('|', 2)
-        if (parts.length === 2) {
-          allDevices.push({ id: parts[0], name: parts[1] })
+        const parts = line.split('|', 3)
+        if (parts.length >= 2) {
+          allDevices.push({ id: parts[0], name: parts[1], uuid: normalizeDeviceUuid(parts[2]) })
         }
       }
     } catch (error) {
@@ -965,30 +1518,73 @@ except Exception as e:
     }
 
     this.appLogger.info(`detected devices: ${JSON.stringify(allDevices, null, 2)}`, this.name)
+    // Best-effort: a failure here (e.g. resolving the preferred device) must not
+    // discard a successfully detected list, or the UI silently falls back to the
+    // "Auto select device" placeholder while the real GPU is in use.
+    let bestCudaId: string | undefined
+    try {
+      bestCudaId = await resolveDefaultDevice(
+        allDevices,
+        this.settings.lastSelectedDevicePerBackend,
+        this.name,
+        this.settings.preferredDevice,
+        this.settings.lastSelectedDeviceUuidPerBackend,
+      )
+    } catch (error) {
+      this.appLogger.warn(
+        `Default CUDA device resolution failed; using first detected device: ${error}`,
+        this.name,
+      )
+    }
     this.devices =
-      allDevices.length > 0 ? allDevices.map((d) => ({ ...d, selected: false })) : availableDevices
+      allDevices.length > 0
+        ? withSelectedDevice(
+            allDevices.map((d) => ({ ...d, selected: false })),
+            this.settings.lastSelectedDevicePerBackend[this.name],
+            (ds) => ds.find((d) => d.id === bestCudaId) ?? ds[0],
+            this.settings.lastSelectedDeviceUuidPerBackend[this.name],
+          )
+        : availableDevices
     this.updateStatus()
   }
 
   private async detectXpuDevicesWithTorch(): Promise<void> {
-    const availableDevices = [{ id: '*', name: 'Auto select device', selected: true }]
     let allDevices: Device[] = []
     try {
       const pythonScript = `
-import torch
 import sys
 
 try:
+    import torch
+    # Intel-torch builds that predate native XPU (torch < 2.5) only register the
+    # torch.xpu backend after intel_extension_for_pytorch is imported. Without
+    # this, torch.xpu.device_count() returns 0 on those builds and the GPU is
+    # wrongly reported as absent (device dropdown falls back to "Auto"). On
+    # native-XPU torch the import is unnecessary and its absence is non-fatal, so
+    # both supported ComfyUI variants enumerate the Intel GPU consistently.
+    try:
+        import intel_extension_for_pytorch  # noqa: F401
+    except Exception:
+        pass
+
+    if not hasattr(torch, "xpu"):
+        print("Error detecting XPU devices: torch has no xpu backend")
+        sys.exit(1)
+
     # Try to get the number of XPU devices
     device_count = torch.xpu.device_count()
-    
-    # For each device, get its name and print it
+
+    # For each device, get its name (and UUID when the build exposes it) and print it
     for i in range(device_count):
         try:
             device_name = torch.xpu.get_device_name(i)
-            print(f"{i}|{device_name}")
-        except Exception as e:
-            print(f"{i}|Unknown Device")
+        except Exception:
+            device_name = "Unknown Device"
+        try:
+            uuid = str(getattr(torch.xpu.get_device_properties(i), "uuid", "") or "")
+        except Exception:
+            uuid = ""
+        print(f"{i}|{device_name}|{uuid}")
 except Exception as e:
     print(f"Error detecting XPU devices: {str(e)}")
     sys.exit(1)
@@ -1022,12 +1618,12 @@ except Exception as e:
             continue
           }
 
-          const parts = line.split('|', 2)
-          if (parts.length == 2) {
+          const parts = line.split('|', 3)
+          if (parts.length >= 2) {
             const id = `${i}`
             const name = parts[1]
 
-            devices.push({ id, name })
+            devices.push({ id, name, uuid: normalizeDeviceUuid(parts[2]) })
           }
         }
         i = i + 1
@@ -1038,15 +1634,136 @@ except Exception as e:
       console.error('Error detecting level_zero devices:', error)
     }
     this.appLogger.info(`detected devices: ${JSON.stringify(allDevices, null, 2)}`, this.name)
-    this.devices =
-      allDevices.length > 0 ? allDevices.map((d) => ({ ...d, selected: false })) : availableDevices
+    if (allDevices.length === 0) {
+      // torch.xpu.device_count() returned 0 — Level Zero loader is present but the
+      // Intel GPU driver can't enumerate any devices (missing intel-level-zero-gpu,
+      // wrong permissions on /dev/dri/renderD128, or driver mismatch). Running as
+      // XPU variant with 0 devices would crash ComfyUI; fall back to CPU instead.
+      this.appLogger.warn(
+        '[comfyui-variant] torch.xpu found 0 XPU devices — Intel GPU not accessible via Level Zero. ' +
+          'Falling back to CPU. Check: (1) intel-level-zero-gpu package installed, ' +
+          '(2) user is in the "render" group, (3) /dev/dri/renderD128 permissions.',
+        this.name,
+        true,
+      )
+      this.usableXpuConfirmed = false
+      this.comfyUiVariant = 'cpu'
+      this.devices = [{ id: '*', name: 'Auto select device', selected: true }]
+      this.updateStatus()
+      return
+    }
+    // A device probe positively confirmed at least one usable XPU device, so it
+    // is safe for spawnAPIProcess() to launch as the XPU variant.
+    this.usableXpuConfirmed = true
+    // Best-effort (see detectCudaDevicesWithTorch): don't let default-device
+    // resolution errors blank an already-detected device list.
+    let bestXpuId: string | undefined
+    try {
+      bestXpuId = await resolveDefaultDevice(
+        allDevices,
+        this.settings.lastSelectedDevicePerBackend,
+        this.name,
+        this.settings.preferredDevice,
+        this.settings.lastSelectedDeviceUuidPerBackend,
+      )
+    } catch (error) {
+      this.appLogger.warn(
+        `Default XPU device resolution failed; using first detected device: ${error}`,
+        this.name,
+      )
+    }
+    this.devices = withSelectedDevice(
+      allDevices.map((d) => ({ ...d, selected: false })),
+      this.settings.lastSelectedDevicePerBackend[this.name],
+      (ds) => ds.find((d) => d.id === bestXpuId) ?? ds[0],
+      this.settings.lastSelectedDeviceUuidPerBackend[this.name],
+    )
     this.updateStatus()
+  }
+
+  /**
+   * Remove stale SQLite WAL/SHM sidecar files left behind by a crashed ComfyUI
+   * run. ComfyUI opens `comfyui.db` in WAL mode; an unclean shutdown can leave a
+   * locked/orphaned `comfyui.db-wal` / `comfyui.db-shm` pair that makes SQLite
+   * refuse to open the database on the next start, blocking ComfyUI entirely.
+   *
+   * Safe to call here because spawnAPIProcess() runs before any ComfyUI process
+   * is alive, so nothing holds the files; SQLite recovers from the main `.db`.
+   * The DB lives under ComfyUI's user directory (default `<serviceDir>/user`,
+   * since we don't pass --user-directory).
+   */
+  private cleanupStaleComfyUiDbLocks(): void {
+    const userDir = path.join(this.serviceDir, 'user')
+    for (const sidecar of ['comfyui.db-wal', 'comfyui.db-shm']) {
+      const sidecarPath = path.join(userDir, sidecar)
+      try {
+        if (filesystem.existsSync(sidecarPath)) {
+          filesystem.removeSync(sidecarPath)
+          this.appLogger.info(`Removed stale ComfyUI DB lock file: ${sidecarPath}`, this.name)
+        }
+      } catch (e) {
+        this.appLogger.warn(
+          `Failed to remove stale ComfyUI DB lock file ${sidecarPath}: ${e}`,
+          this.name,
+        )
+      }
+    }
   }
 
   async spawnAPIProcess(): Promise<{
     process: ChildProcess
     didProcessExitEarlyTracker: Promise<boolean>
   }> {
+    // Kill any ComfyUI left over from a previous session (e.g. after a hard
+    // crash / force-quit that skipped our clean shutdown). We match on this
+    // backend's python binary path, which is unique to ComfyUI's env dir. The
+    // port is picked fresh each launch, so an orphan sits on a *different* port
+    // and would otherwise run beside the new instance → GPU out-of-memory.
+    await killStaleProcessesByCommandLine(this.getPythonBinaryPath(), {
+      name: this.name,
+      label: 'ComfyUI',
+      appLogger: this.appLogger,
+    })
+
+    // Clear any stale SQLite WAL/SHM sidecars from a crashed run that would
+    // otherwise block ComfyUI from opening its database.
+    this.cleanupStaleComfyUiDbLocks()
+
+    // Re-apply ComfyUI-Manager security_level=strong on every start so that
+    // (a) installs that predate this hardening get locked down on next launch,
+    // and (b) anyone tampering with config.ini gets it reverted.
+    try {
+      await configureComfyUiManagerSecurityLevel(this.serviceDir, 'strong')
+    } catch (error) {
+      this.appLogger.warn(`Failed to enforce ComfyUI-Manager security_level: ${error}`, this.name)
+    }
+
+    // Regenerate the per-launch loopback auth token so the env block of any
+    // previous ComfyUI process is no longer reusable.
+    this.loopbackAuthToken = randomBytes(32).toString('hex')
+
+    // Defensive XPU usability guard. `comfyUiVariant` can be 'xpu' here either
+    // from a stale aipg-variant.json marker or from the transient window inside
+    // detectDevices(), which sets the variant to 'xpu' synchronously and only
+    // flips it to 'cpu' after its multi-second torch.xpu probe completes. Two
+    // startup orchestrators (the main-process apiServiceRegistry and the
+    // renderer backendServices store) call detectDevices()/start() concurrently
+    // on the same instance, so a spawn can observe 'xpu' before any probe has
+    // confirmed a usable device. On a machine whose Intel GPU is not actually
+    // usable (e.g. Resizable BAR disabled -> torch.xpu.device_count() == 0),
+    // launching as XPU makes ComfyUI "assume Nvidia" and crash with
+    // "Torch not compiled with CUDA enabled". Only run as XPU once a probe has
+    // positively confirmed at least one device; otherwise fall back to CPU.
+    // Runs before the stale-ipex cleanup below so the CPU fallback also strips
+    // any leftover ipex_to_cuda injection from a previous XPU install.
+    if (
+      process.platform === 'linux' &&
+      this.comfyUiVariant === 'xpu' &&
+      this.usableXpuConfirmed !== true
+    ) {
+      await this.detectXpuDevicesWithTorch()
+    }
+
     // Ensure non-XPU variants don't keep stale ipex_to_cuda injection from previous installs.
     if (this.comfyUiVariant !== 'xpu') {
       const mmPath = path.join(this.serviceDir, 'comfy/model_management.py')
@@ -1071,6 +1788,75 @@ except Exception as e:
 
     const additionalEnvVariables = this.getEnvVars()
     const mediaDir = getMediaDir()
+
+    // Shared all-users install: ComfyUI's install (this.serviceDir) lives in the
+    // read-only/shared resources root, so redirect its per-run scratch (user
+    // settings/workflows, temp, uploaded inputs) into this user's private config
+    // root. Output already goes to the per-user media dir below. In non-shared
+    // modes writableConfigRoot() === the resources root, so scratch keeps its
+    // default in-tree location and behaviour is unchanged.
+    const comfyScratchFlags: string[] = []
+    if (writableConfigRoot() !== packagedResourcesRoot()) {
+      const scratch = path.join(writableConfigRoot(), 'comfyui')
+      const userDir = path.join(scratch, 'user')
+      const tempDir = path.join(scratch, 'temp')
+      const inputDir = path.join(scratch, 'input')
+      for (const dir of [userDir, tempDir, inputDir]) {
+        try {
+          filesystem.mkdirSync(dir, { recursive: true })
+        } catch {
+          /* best effort — ComfyUI will surface a clearer error if a dir is missing */
+        }
+      }
+      comfyScratchFlags.push(
+        '--user-directory',
+        userDir,
+        '--temp-directory',
+        tempDir,
+        '--input-directory',
+        inputDir,
+      )
+    }
+    // --enable-cors-header is required so ComfyUI's origin_only_middleware
+    // doesn't 403 our cross-origin requests from the renderer (Vite dev origin
+    // / file:// in prod both trigger Sec-Fetch-Site: cross-site against
+    // 127.0.0.1:<port>). We pin a specific origin instead of the wildcard so
+    // a malicious page in any other browser tab cannot drive the local
+    // ComfyUI API via CORS.
+    //
+    // Also reject user-supplied --listen overrides that target non-loopback
+    // addresses (defense against malicious settings injection / accidental
+    // misconfiguration).
+    const rendererOrigin = getRendererOrigin()
+    let userParameters = sanitizeUserComfyUiParameters(this.comfyUiParametersString, (msg) =>
+      this.appLogger.warn(msg, this.name, true),
+    )
+
+    // The CPU variant must run with --cpu, but ComfyUI's argparse puts --cpu in a
+    // mutually-exclusive group with the VRAM-mode flags (--lowvram/--gpu-only/…).
+    // The default parameters include "--lowvram --reserve-vram 6.0", so strip the
+    // GPU-only VRAM flags (and their values) before appending --cpu.
+    if (this.comfyUiVariant === 'cpu') {
+      const vramModeFlags = new Set([
+        '--gpu-only',
+        '--highvram',
+        '--normalvram',
+        '--lowvram',
+        '--novram',
+      ])
+      const filtered: string[] = []
+      for (let i = 0; i < userParameters.length; i++) {
+        const arg = userParameters[i]
+        if (vramModeFlags.has(arg)) continue
+        if (arg === '--reserve-vram') {
+          i++ // also skip its value
+          continue
+        }
+        filtered.push(arg)
+      }
+      userParameters = filtered
+    }
+
     const parameters = [
       'main.py',
       '--port',
@@ -1079,7 +1865,17 @@ except Exception as e:
       'auto',
       '--output-directory',
       mediaDir,
-      ...this.comfyUiParametersString.split(/\s+/).filter(Boolean),
+      ...comfyScratchFlags,
+      ...userParameters,
+      // For the CPU variant (e.g. Linux studio/essentials without a usable Intel
+      // GPU runtime), force ComfyUI onto CPU. Without this, ComfyUI's device
+      // autodetect "assumes Nvidia" and calls torch.cuda, crashing with
+      // "Torch not compiled with CUDA enabled" on a CPU-only torch build.
+      ...(this.comfyUiVariant === 'cpu' ? ['--cpu'] : []),
+      // Force-append after user params so we always win, even if the user
+      // tried to inject their own --enable-cors-header.
+      '--enable-cors-header',
+      rendererOrigin,
     ]
     this.appLogger.info(
       `starting comfyui with ${JSON.stringify({ parameters, additionalEnvVariables })}`,
@@ -1090,7 +1886,10 @@ except Exception as e:
     const apiProcess = spawn(pythonBinary, parameters, {
       cwd: this.serviceDir,
       windowsHide: true,
-      env: Object.assign(process.env, additionalEnvVariables),
+      // Build a fresh env object instead of mutating process.env — otherwise the
+      // injected LD_LIBRARY_PATH / device-selector vars would leak into every
+      // later child process spawned from the main Electron process.
+      env: { ...process.env, ...additionalEnvVariables },
     })
 
     //must be at the same tick as the spawn function call

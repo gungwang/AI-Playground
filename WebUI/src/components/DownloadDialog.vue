@@ -4,6 +4,8 @@
       class="dialog-mask absolute left-0 top-0 w-full h-full bg-background/55 flex justify-center items-center"
     >
       <div
+        role="dialog"
+        aria-label="Model download"
         class="py-20 px-20 min-w-768px flex flex-col items-center justify-center bg-card rounded-3xl gap-8 text-foreground"
         :class="{ 'animate-scale-in': animate }"
       >
@@ -140,7 +142,13 @@
               }}
             </span>
           </div>
-          <label class="flex items-center gap-2">
+          <div
+            v-if="modelFolderReadOnly"
+            class="flex flex-col items-center gap-2 p-4 border border-amber-500 bg-amber-500/10 rounded-lg"
+          >
+            <span class="text-left">{{ languages.DOWNLOADER_READONLY_MODEL_DIR }}</span>
+          </div>
+          <label v-if="!modelFolderReadOnly" class="flex items-center gap-2">
             <Checkbox v-model="readTerms" />
             <span class="text-sm text-left">{{ languages.DOWNLOADER_TERMS_TIP }}</span>
           </label>
@@ -151,7 +159,10 @@
             <button
               @click="confirmDownload"
               :disabled="
-                sizeRequesting || !readTerms || downloadModelRender.every((i) => !i.accessGranted)
+                modelFolderReadOnly ||
+                sizeRequesting ||
+                !readTerms ||
+                downloadModelRender.every((i) => !i.accessGranted)
               "
               class="bg-primary py-1 px-4 rounded"
             >
@@ -161,7 +172,25 @@
         </div>
         <div v-else-if="hashError" class="flex flex-col items-center justify-center gap-4">
           <p>{{ errorText }}</p>
-          <button @click="close" class="bg-red-500 py-1 px-4">{{ i18nState.COM_CLOSE }}</button>
+          <p
+            v-if="downloadErrorRetryable"
+            class="text-sm text-muted-foreground text-center max-w-md"
+          >
+            {{ i18nState.ERR_DOWNLOAD_RESUME_HINT }}
+          </p>
+          <div class="flex flex-wrap justify-center items-center gap-4">
+            <button
+              v-if="downloadErrorRetryable"
+              type="button"
+              @click="retryDownload"
+              class="bg-primary py-1 px-4 rounded"
+            >
+              {{ i18nState.COM_RETRY }}
+            </button>
+            <button type="button" @click="close" class="bg-red-500 py-1 px-4 rounded">
+              {{ i18nState.COM_CLOSE }}
+            </button>
+          </div>
         </div>
         <template v-else>
           <progress-bar :text="allDownloadTip" :percent="taskPercent" class="w-3/4"></progress-bar>
@@ -176,21 +205,24 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, toRaw } from 'vue'
+import { ref, watch, nextTick, computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useGlobalSetup } from '@/assets/js/store/globalSetup'
 import ProgressBar from './ProgressBar.vue'
 import { Checkbox } from '@/components/ui/checkbox'
 import { useI18N } from '@/assets/js/store/i18n'
-import { SSEProcessor } from '@/assets/js/sseProcessor'
-import * as util from '@/assets/js/util'
 import * as toast from '@/assets/js/toast'
 import { useModels } from '@/assets/js/store/models'
 import { useDialogStore } from '@/assets/js/store/dialogs.ts'
 import { EtaEstimator } from '@/lib/etaEstimator'
+import { aipgFetch } from '@/lib/loopbackAuth'
+import { fetchModelMeta, runModelDownload } from '@/lib/modelDownloader'
+import { createCancellation } from '@/assets/js/errors/appError'
 
 const i18nState = useI18N().state
+const languages = i18nState
 const globalSetup = useGlobalSetup()
+const modelFolderReadOnly = computed(() => globalSetup.state.modelFolderReadOnly === true)
 const models = useModels()
 const dialogStore = useDialogStore()
 
@@ -201,74 +233,17 @@ let downloding = false
 const curDownloadTip = ref('')
 const allDownloadTip = ref('')
 const percent = ref(0)
-const completeCount = ref(0)
 const taskPercent = ref(0)
 const showConfirm = ref(false)
 const sizeRequesting = ref(false)
 const hashError = ref(false)
 const errorText = ref('')
+const downloadErrorRetryable = ref(false)
 let abortController: AbortController
 const animate = ref(false)
 const readTerms = ref(false)
 const downloadModelRender = ref<DownloadModelRender[]>([])
 const etaEstimator = new EtaEstimator(100)
-
-function dataProcess(line: string) {
-  console.log(line)
-  const dataJson = line.slice(5)
-  const data = JSON.parse(dataJson) as LLMOutCallback
-  switch (data.type) {
-    case 'download_model_progress': {
-      const etaStr = etaEstimator.updateAndEstimate(data.percent)
-      curDownloadTip.value = `${i18nState.COM_DOWNLOAD_MODEL} ${data.repo_id}\r\n${data.download_size}/${data.total_size} ${data.percent}% ${i18nState.COM_DOWNLOAD_SPEED}: ${data.speed} ETA: ${etaStr}`
-      percent.value = data.percent
-      break
-    }
-    case 'download_model_completed':
-      completeCount.value++
-      const allTaskCount = downloadModelRender.value.length
-      if (completeCount.value == allTaskCount) {
-        downloding = false
-        dialogStore.closeDownloadDialog()
-        downloadSuccessFunction.value?.()
-      } else {
-        taskPercent.value = util.toFixed((completeCount.value / allTaskCount) * 100, 1)
-        percent.value = 100
-        allDownloadTip.value = `${i18nState.DOWNLOADER_DONWLOAD_TASK_PROGRESS} ${completeCount.value}/${allTaskCount}`
-      }
-      models.refreshModels()
-      break
-    case 'allComplete':
-      downloding = false
-      dialogStore.closeDownloadDialog()
-      break
-    case 'error':
-      hashError.value = true
-      abortController?.abort()
-      fetch(`${globalSetup.apiHost}/api/stopDownloadModel`)
-
-      switch (data.err_type) {
-        case 'not_enough_disk_space':
-          errorText.value = i18nState.ERR_NOT_ENOUGH_DISK_SPACE.replace(
-            '{requires_space}',
-            data.requires_space,
-          ).replace('{free_space}', data.free_space)
-          break
-        case 'download_exception':
-          errorText.value = i18nState.ERR_DOWNLOAD_FAILED
-          break
-        case 'runtime_error':
-          errorText.value = i18nState.ERROR_RUNTIME_ERROR
-          break
-        case 'unknown_exception':
-          errorText.value = i18nState.ERROR_GENERATE_UNKONW_EXCEPTION
-          break
-      }
-
-      downloadFailFunction.value?.({ type: 'error', error: errorText.value })
-      break
-  }
-}
 
 watch(downloadDialogVisible, async (isVisible) => {
   if (isVisible) {
@@ -292,6 +267,7 @@ async function initializeDownloadDialog() {
   curDownloadTip.value = i18nState.DOWNLOADER_CONFRIM_TIP
   showConfirm.value = true
   hashError.value = false
+  downloadErrorRetryable.value = false
   percent.value = 0
   taskPercent.value = 0
   downloadModelRender.value = downloadList.value.map((item) => {
@@ -300,38 +276,16 @@ async function initializeDownloadDialog() {
   readTerms.value = false
 
   try {
-    const sizeResponse = await fetch(`${globalSetup.apiHost}/api/getModelSize`, {
-      method: 'POST',
-      body: JSON.stringify(downloadList.value),
-      headers: {
-        'Content-Type': 'application/json',
-      },
+    const meta = await fetchModelMeta(downloadList.value, {
+      apiHost: globalSetup.apiHost,
+      hfToken: models.hfToken,
     })
-    const gatedResponse = await fetch(`${globalSetup.apiHost}/api/isModelGated`, {
-      method: 'POST',
-      body: JSON.stringify([downloadList.value, models.hfToken]),
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
-    const accessResponse = await fetch(`${globalSetup.apiHost}/api/isAccessGranted`, {
-      method: 'POST',
-      body: JSON.stringify([downloadList.value, models.hfToken]),
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
-    const sizeData = (await sizeResponse.json()) as ApiResponse & { sizeList: StringKV }
-    const gatedData = (await gatedResponse.json()) as ApiResponse & {
-      gatedList: Record<string, boolean>
-    }
-    const accessData = (await accessResponse.json()) as ApiResponse & {
-      accessList: Record<string, boolean>
-    }
+    const byKey = new Map(meta.map((m) => [`${m.repo_id}_${m.type}`, m]))
     for (const item of downloadModelRender.value) {
-      item.size = sizeData.sizeList[`${item.repo_id}_${item.type}`] || ''
-      item.gated = gatedData.gatedList[item.repo_id] || false
-      item.accessGranted = accessData.accessList[item.repo_id] || false
+      const m = byKey.get(`${item.repo_id}_${item.type}`)
+      item.size = m?.size || ''
+      item.gated = m?.gated || false
+      item.accessGranted = m?.accessGranted || false
     }
     sizeRequesting.value = false
   } catch (ex) {
@@ -368,6 +322,8 @@ function getInfoUrl(repoId: string, type: string) {
 function getFunctionTip(type: string): string {
   switch (type) {
     case 'llm':
+    case 'ggufLLM':
+    case 'openvinoLLM':
       return i18nState.DOWNLOADER_FOR_ANSWER_GENERATE
     case 'embedding':
       return i18nState.DOWNLOADER_FOR_RAG_QUERY
@@ -383,47 +339,100 @@ function download() {
   )
   allDownloadTip.value = `${i18nState.DOWNLOADER_DONWLOAD_TASK_PROGRESS} 0/${accessableDownloadList.length}`
   percent.value = 0
-  completeCount.value = 0
+  taskPercent.value = 0
   abortController = new AbortController()
   curDownloadTip.value = ''
-  fetch(`${globalSetup.apiHost}/api/downloadModel`, {
-    method: 'POST',
-    body: JSON.stringify(toRaw({ data: accessableDownloadList })),
-    headers: {
-      'Content-Type': 'application/json',
-      ...(models.hfTokenIsValid ? { Authorization: `Bearer ${models.hfToken}` } : {}),
-    },
+  runModelDownload(accessableDownloadList, {
+    apiHost: globalSetup.apiHost,
+    hfToken: models.hfTokenIsValid ? models.hfToken : undefined,
     signal: abortController.signal,
+    onProgress: (p) => {
+      // Per-file progress events carry a speed; the synthetic 100% event emitted
+      // on completion does not — only refresh the ETA line on real progress.
+      if (p.speed !== undefined) {
+        const etaStr = etaEstimator.updateAndEstimate(p.percent)
+        curDownloadTip.value = `${i18nState.COM_DOWNLOAD_MODEL} ${p.repoId}\r\n${p.downloadSize}/${p.totalSize} ${p.percent}% ${i18nState.COM_DOWNLOAD_SPEED}: ${p.speed} ETA: ${etaStr}`
+      }
+      percent.value = p.percent
+      taskPercent.value = p.taskPercent
+      allDownloadTip.value = `${i18nState.DOWNLOADER_DONWLOAD_TASK_PROGRESS} ${p.completed}/${p.total}`
+    },
+    onModelCompleted: () => {
+      models.refreshModels()
+    },
+    onError: (e) => {
+      hashError.value = true
+      downloding = false
+      downloadErrorRetryable.value = e.retryable
+      switch (e.errType) {
+        case 'not_enough_disk_space':
+          errorText.value = i18nState.ERR_NOT_ENOUGH_DISK_SPACE.replace(
+            '{requires_space}',
+            e.requiresSpace ?? '',
+          ).replace('{free_space}', e.freeSpace ?? '')
+          break
+        case 'repositories_not_found':
+          errorText.value = i18nState.ERROR_REPO_NOT_EXISTS
+          break
+        case 'download_exception':
+          errorText.value = i18nState.ERR_DOWNLOAD_FAILED
+          break
+        case 'runtime_error':
+          errorText.value = i18nState.ERROR_RUNTIME_ERROR
+          break
+        default:
+          errorText.value = i18nState.ERROR_GENERATE_UNKONW_EXCEPTION
+          break
+      }
+      downloadFailFunction.value?.({ type: 'error', error: errorText.value })
+    },
   })
-    .then((response) => {
-      const reader = response.body!.getReader()
-      return new SSEProcessor(reader, dataProcess, undefined).start()
+    .then(() => {
+      downloding = false
+      dialogStore.closeDownloadDialog()
+      downloadSuccessFunction.value?.()
     })
-    .catch((ex) => {
-      downloadFailFunction.value?.({ type: 'error', error: ex })
+    .catch(() => {
+      // onError already surfaced a structured failure; an abort or other
+      // rejection just needs to stop the spinner.
       downloding = false
     })
 }
 
 function cancelConfirm() {
-  downloadFailFunction.value?.({ type: 'cancelConfrim' })
+  downloadFailFunction.value?.(
+    createCancellation({ technicalMessage: 'Download cancelled by user' }),
+  )
   dialogStore.closeDownloadDialog()
 }
 
 function confirmDownload() {
   showConfirm.value = false
   hashError.value = false
+  downloadErrorRetryable.value = false
   return download()
+}
+
+function retryDownload() {
+  etaEstimator.reset()
+  hashError.value = false
+  downloadErrorRetryable.value = false
+  errorText.value = ''
+  download()
 }
 
 function cancelDownload() {
   abortController?.abort()
-  fetch(`${globalSetup.apiHost}/api/stopDownloadModel`)
-  downloadFailFunction.value?.({ type: 'cancelDownload' })
+  aipgFetch(`${globalSetup.apiHost}/api/stopDownloadModel`)
+  downloadFailFunction.value?.(
+    createCancellation({ technicalMessage: 'Download cancelled by user' }),
+  )
+  downloding = false
   dialogStore.closeDownloadDialog()
 }
 
 function close() {
+  downloding = false
   dialogStore.closeDownloadDialog()
 }
 </script>

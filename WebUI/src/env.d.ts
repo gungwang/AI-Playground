@@ -3,6 +3,53 @@ declare interface Window {
   chrome: Chrome
   electronAPI: electronAPI
   envVars: { platformTitle: string; productVersion: string; debugToolsEnabled: boolean }
+  // Dev-only Home Agent mock-channel drive surface (see channels/mockAdapter.ts).
+  // Only attached when debug tools are enabled.
+  __homeAgentMock?: HomeAgentMockApi
+}
+
+type HomeAgentMockInboundOpts = {
+  chat_id?: string
+  channel?: string
+  ts?: string
+  images?: Array<{ mime: string; data_base64: string }>
+  audio?: Array<{ mime: string; data_base64: string }>
+  documents?: Array<{ filename: string; mime: string; data_base64: string }>
+}
+
+type HomeAgentMockOutboundEvent = {
+  kind:
+    | 'reply'
+    | 'photo'
+    | 'video'
+    | 'voice'
+    | 'document'
+    | 'keyboard'
+    | 'keyboardEdit'
+    | 'draftUpdate'
+    | 'draftFinal'
+    | 'typingStart'
+    | 'typingStop'
+  text?: string
+  caption?: string
+  filename?: string
+  mime?: string
+  base64?: string
+  buttons?: Array<Array<{ text: string; callbackData: string }>>
+  meta?: { channel?: string; ts?: string; chatId?: string }
+  ts: number
+}
+
+type HomeAgentMockApi = {
+  send(text: string, opts?: HomeAgentMockInboundOpts): Promise<void>
+  sendCallback(callback: string): Promise<void>
+  sendMedia(
+    url: string,
+    opts?: { kind?: 'image' | 'video' | 'model3d'; caption?: string },
+  ): Promise<void>
+  outbox(): HomeAgentMockOutboundEvent[]
+  clear(): void
+  waitForIdle(timeoutMs?: number): Promise<void>
 }
 
 interface ImportMetaEnv {
@@ -20,6 +67,10 @@ type ServiceSettings = {
   releaseTag?: string
   comfyUiParameters?: string
   llamaCppParameters?: string
+  llamaCppBuildVariant?: 'standard' | 'ssd-offload'
+  llamaCppOffloadDrive?: string | null
+  // OVMS --kv_cache_precision value ('u8' | 'u4' | 'f16' | 'fp32'); '' = OVMS default.
+  ovmsKvCachePrecision?: string
 }
 
 type SamplePrompt = {
@@ -28,6 +79,17 @@ type SamplePrompt = {
   prompt: string
   mode: ModeType
   presetName?: string
+}
+
+// A desktop window the screenshot tool can be bound to. Stored as id + name so
+// capture can fall back to title matching when the (unstable) id is gone.
+type ScreenshotWindow = {
+  id: string
+  name: string
+}
+
+type ScreenshotWindowSource = ScreenshotWindow & {
+  thumbnailDataUrl: string | null
 }
 
 type DemoProfile = {
@@ -56,15 +118,42 @@ type LocalSettings = {
   isDemoModeEnabled: boolean
   demoModeResetInSeconds: number | null
   demoModePasscode?: string
+  isHomeAgentEnabled: boolean
+  isCloudModeEnabled: boolean
+  isQwen3TtsEnabled?: boolean
   languageOverride: string | null
   remoteRepository: string
   huggingfaceEndpoint: string
+  mcpAutoDetectionDismissed: string[]
+  openvinoImageGenDevices: string[]
+  preferredDevice: PreferredDevice | null
+  /** Dev unpackaged: set via settings-dev.json / userData overlay. */
+  PhisonSSDdetected?: boolean
 }
+
+type DeviceCategory = 'dgpu' | 'igpu' | 'npu' | 'cpu' | 'unknown'
 
 type GpuHardwareDevice = {
   device: string
   name: string
   gpuDeviceId: string | null
+  /** Stable vendor UUID when the probe can supply one (NVIDIA via nvidia-smi,
+   *  Intel via xpu-smi). null on the PowerShell/lspci fallbacks. Preferred over
+   *  name for identifying a device across driver/enumeration changes. */
+  uuid?: string | null
+  category?: DeviceCategory
+}
+
+/** User's preferred inference device, chosen in the setup wizard. `uuid` is the
+ *  stable identity (when known); `gpuDeviceId` is the weaker PCI model id. */
+type PreferredDevice = {
+  name: string
+  gpuDeviceId: string | null
+  uuid?: string | null
+  /** Per-instance id from the hardware probe (`GpuHardwareDevice.device`).
+   *  Disambiguates two identically-named GPUs in the wizard when no UUID is
+   *  available (PowerShell/lspci fallback). */
+  instanceId?: string
 }
 
 type ProductModeCatalogFeatureI18n = {
@@ -119,6 +208,7 @@ type McpToolInfo = {
 type McpServerInfo = {
   id: string
   name: string
+  instructions?: string
 }
 
 type McpServerConfig =
@@ -128,12 +218,14 @@ type McpServerConfig =
       args?: string[]
       env?: Record<string, string>
       displayName?: string
+      instructions?: string
     }
   | {
       type: 'http'
       url: string
       headers?: Record<string, string>
       displayName?: string
+      instructions?: string
     }
 
 type McpToolCallResult = {
@@ -142,8 +234,42 @@ type McpToolCallResult = {
   structuredContent?: unknown
 }
 
-// AipgPage type kept for backward compatibility with getInitialPage IPC handler
-type AipgPage = 'create' | 'enhance' | 'answer' | 'learn-more'
+type WebPageLink = {
+  index: number
+  text: string
+  href: string
+}
+
+type WebPageSnapshot = {
+  title: string
+  url: string
+  text: string
+  links: WebPageLink[]
+}
+
+type WebBrowserState = {
+  isOpen: boolean
+  isVisible: boolean
+  currentUrl: string
+  title: string
+}
+
+type WebBrowserInteraction =
+  | { action: 'click'; linkIndex?: number; selector?: string }
+  | { action: 'scroll'; selector?: string }
+  | { action: 'back' }
+
+type WebSearchResult = {
+  title: string
+  url: string
+  snippet: string
+}
+
+type WebSearchResults = {
+  query: string
+  results: WebSearchResult[]
+}
+
 type DemoModePage = 'chat' | 'imageGen' | 'imageEdit' | 'video'
 type WorkflowModeType = 'imageGen' | 'imageEdit' | 'video'
 type ModeType = 'chat' | WorkflowModeType
@@ -188,10 +314,20 @@ type electronAPI = {
   setIgnoreMouseEvents(ignore: boolean): void
   miniWindow(): void
   exitApp(): void
-  getInitialPage(): Promise<AipgPage>
+  getInitialPage(): Promise<ModeType | null>
   getDemoModeSettings(): Promise<DemoModeSettings>
   saveImage(url: string): void
   saveImageToMediaInput(dataUri: string): Promise<string>
+  saveGeneratedAudio(
+    audioBase64: string,
+    filename: string,
+  ): Promise<{ success: boolean; filePath?: string; error?: string }>
+  readLocalAudioAsDataUri(
+    filePath: string,
+  ): Promise<{ success: boolean; dataUri?: string; error?: string }>
+  readAipgMediaAsBase64(
+    url: string,
+  ): Promise<{ success: true; data: string } | { success: false; error: string }>
   openImageWin(url: string, title: string, width: number, height: number): void
   wakeupApiService(): void
   screenChange(callback: (width: number, height: number) => void): void
@@ -202,14 +338,16 @@ type electronAPI = {
   getEmbeddingServerUrl(
     serviceName: string,
   ): Promise<{ success: boolean; url?: string; error?: string }>
+  ensureEmbeddingServerReady(
+    serviceName: string,
+    embeddingModelName: string,
+  ): Promise<{ success: boolean; error?: string }>
   getInitSetting(): Promise<SetupData>
   updateModelPaths(modelPaths: ModelPaths): Promise<ModelLists>
   restorePathsSettings(): Promise<void>
-  refreshLLMModles(): Promise<string[]>
   loadModels(): Promise<Model[]>
   zoomIn(): Promise<void>
   zoomOut(): Promise<void>
-  getDownloadedLLMs(): Promise<string[]>
   getDownloadedGGUFLLMs(): Promise<string[]>
   getDownloadedOpenVINOLLMModels(): Promise<string[]>
   getDownloadedEmbeddingModels(): Promise<Model[]>
@@ -228,7 +366,9 @@ type electronAPI = {
   wakeupComfyUIService(): void
   getComfyUiDefaultParameters(): Promise<string>
   getLlamaCppDefaultParameters(): Promise<string>
+  detectPhisonSsd(): Promise<{ detected: boolean }>
   getServices(): Promise<ApiServiceInformation[]>
+  getBackendAuthToken(serviceName: string): Promise<string>
   updateServiceSettings(settings: ServiceSettings): Promise<BackendStatus>
 
   uninstall(serviceName: string): Promise<void>
@@ -255,6 +395,28 @@ type electronAPI = {
   startTranscriptionServer(modelName: string): Promise<{ success: boolean; error?: string }>
   stopTranscriptionServer(): Promise<{ success: boolean; error?: string }>
   getTranscriptionServerUrl(): Promise<{ success: boolean; url?: string; error?: string }>
+  startSpeechServer(modelName: string): Promise<{ success: boolean; error?: string }>
+  stopSpeechServer(): Promise<{ success: boolean; error?: string }>
+  getSpeechServerUrl(): Promise<{ success: boolean; url?: string; error?: string }>
+  synthesizeSpeech(options: {
+    baseURL: string
+    model: string
+    input: string
+    voice?: string
+    apiKey?: string
+    format?: string
+  }): Promise<
+    { success: true; dataBase64: string; mediaType: string } | { success: false; error: string }
+  >
+  ensureOvmsImageReady(
+    serviceName: string,
+    modelName: string,
+    keepModelsLoaded?: boolean,
+    resolution?: string,
+  ): Promise<{ success: boolean; url?: string; error?: string }>
+  stopOvmsImageServer(): Promise<{ success: boolean; error?: string }>
+  stopOvmsChatServers(): Promise<{ success: boolean; error?: string }>
+  getOvmsImageServerUrl(): Promise<{ success: boolean; url?: string; error?: string }>
   // ComfyUI Tools - uses uv for Python package management
   comfyui: {
     isGitInstalled(): Promise<boolean>
@@ -266,6 +428,7 @@ type electronAPI = {
     downloadCustomNode(nodeRepoData: ComfyUICustomNodeRepoId): Promise<boolean>
     uninstallCustomNode(nodeRepoData: ComfyUICustomNodeRepoId): Promise<boolean>
     listInstalledCustomNodes(): Promise<string[]>
+    openInBrowser(): Promise<{ success: boolean; error?: string }>
   }
   mcp: {
     listServers(): Promise<McpServerInfo[]>
@@ -284,17 +447,130 @@ type electronAPI = {
     addServer(
       serverId: string,
       config:
-        | { type?: 'stdio'; command: string; args?: string[]; displayName?: string }
-        | { type: 'http'; url: string; headers?: Record<string, string>; displayName?: string },
+        | {
+            type?: 'stdio'
+            command: string
+            args?: string[]
+            displayName?: string
+            instructions?: string
+          }
+        | {
+            type: 'http'
+            url: string
+            headers?: Record<string, string>
+            displayName?: string
+            instructions?: string
+          },
     ): Promise<void>
     getServerConfig(serverId: string): Promise<McpServerConfig>
     updateServer(
       serverId: string,
       config:
-        | { type?: 'stdio'; command: string; args?: string[]; displayName?: string }
-        | { type: 'http'; url: string; headers?: Record<string, string>; displayName?: string },
+        | {
+            type?: 'stdio'
+            command: string
+            args?: string[]
+            displayName?: string
+            instructions?: string
+          }
+        | {
+            type: 'http'
+            url: string
+            headers?: Record<string, string>
+            displayName?: string
+            instructions?: string
+          },
     ): Promise<void>
     removeServer(serverId: string): Promise<void>
+  }
+  webBrowser: {
+    navigate(url: string): Promise<WebPageSnapshot>
+    readPage(): Promise<WebPageSnapshot>
+    search(query: string, maxResults?: number): Promise<WebSearchResults>
+    interact(interaction: WebBrowserInteraction): Promise<WebPageSnapshot>
+    screenshot(): Promise<string>
+    show(): Promise<WebBrowserState>
+    hide(): Promise<WebBrowserState>
+    close(): Promise<WebBrowserState>
+    getState(): Promise<WebBrowserState>
+    onStateChanged(callback: (state: WebBrowserState) => void): void
+  }
+  screenshot: {
+    listWindows(): Promise<ScreenshotWindowSource[]>
+    captureWindow(target: ScreenshotWindow): Promise<string>
+    getPermissionStatus(): Promise<{
+      platform: string
+      status: 'granted' | 'denied' | 'restricted' | 'not-determined' | 'unknown'
+    }>
+    openPermissionSettings(): void
+  }
+  homeAgent: {
+    saveDocument(
+      filename: string,
+      base64: string,
+    ): Promise<{ success: boolean; filepath?: string; error?: string }>
+    channel: {
+      saveConfig(
+        kind: string,
+        config: Record<string, string>,
+      ): Promise<{ success: boolean; error?: string }>
+      loadConfig(kind: string): Promise<Record<string, string> | null>
+      clearConfig(kind: string): Promise<void>
+      savePrefs(
+        kind: string,
+        prefs: { verified?: boolean; enabled?: boolean },
+      ): Promise<{ success: boolean; error?: string }>
+      loadPrefs(kind: string): Promise<{ verified: boolean; enabled: boolean } | null>
+      test(kind: string): Promise<{ success: boolean; error?: string }>
+      inject(
+        kind: string,
+        config: Record<string, string | undefined>,
+      ): Promise<{ status: string; error?: string }>
+      detectIdentity(
+        kind: string,
+        config: Record<string, string | undefined>,
+      ): Promise<{ identity: string } | { error: string }>
+      detectIdentityFromSaved(kind: string): Promise<{ identity: string } | { error: string }>
+      poll(kind: string): Promise<
+        Array<{
+          text?: string
+          chat_id: string
+          channel?: string
+          ts?: string
+          images?: Array<{ mime: string; data_base64: string }>
+          audio?: Array<{ mime: string; data_base64: string }>
+          documents?: Array<{ filename: string; mime: string; data_base64: string }>
+          callback?: string
+        }>
+      >
+      flushPending(kind: string): Promise<void>
+      send(
+        kind: string,
+        action:
+          | 'reply'
+          | 'update'
+          | 'photo'
+          | 'video'
+          | 'voice'
+          | 'document'
+          | 'typing'
+          | 'keyboard'
+          | 'editMessage',
+        payload: Record<string, unknown>,
+      ): Promise<{
+        success: boolean
+        ts?: string
+        channel?: string
+        messageId?: number
+        error?: string
+      }>
+    }
+  }
+  cloudProvider: {
+    saveKey(providerId: string, key: string): Promise<{ success: boolean; error?: string }>
+    getKey(providerId: string): Promise<string | null>
+    deleteKey(providerId: string): Promise<{ success: boolean; error?: string }>
+    getProxyUrl(): Promise<string>
   }
 }
 
@@ -473,7 +749,7 @@ type NotEnoughDiskSpaceExceptionCallback = {
 
 type ErrorOutCallback = {
   type: 'error'
-  err_type: 'runtime_error' | 'download_exception' | 'unknown_exception'
+  err_type: 'runtime_error' | 'download_exception' | 'unknown_exception' | 'repositories_not_found'
 }
 
 type DownloadModelProgressCallback = {
@@ -542,7 +818,10 @@ type NumberRange = {
 }
 
 type DownloadFailedParams = {
-  type: 'error' | 'cancelConfrim' | 'cancelDownload' | 'conflict'
+  // User cancellation is no longer modeled here; it is rejected as a benign
+  // silent AppError (see createCancellation / CANCELLED_CODE). Only genuine
+  // failures and conflicts flow through this shape.
+  type: 'error' | 'conflict'
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   error?: any
 }
@@ -573,12 +852,21 @@ type CheckModelAlreadyLoadedResult = {
   already_loaded: boolean
 } & CheckModelAlreadyLoadedParameters
 
-type BackendServiceName = 'ai-backend' | 'comfyui-backend' | 'llamacpp-backend' | 'openvino-backend'
+type BackendServiceName =
+  | 'ai-backend'
+  | 'comfyui-backend'
+  | 'llamacpp-backend'
+  | 'openvino-backend'
+  | 'home-agent-backend'
+  | 'qwen3-tts-backend'
 
 type InferenceDevice = {
   id: string
   name: string
   selected: boolean
+  /** Stable vendor UUID when the backend can supply one; used to re-identify a
+   *  device across driver/enumeration changes. undefined/null when unavailable. */
+  uuid?: string | null
 }
 
 type ErrorDetails = {
@@ -599,9 +887,22 @@ type ApiServiceInformation = {
   isSetUp: boolean
   isRequired: boolean
   devices: InferenceDevice[]
+  storageTargets?: StorageTarget[]
+  llamaCppSsdOffloadConfigPath?: string
   sttDevices?: InferenceDevice[]
   errorDetails: ErrorDetails | null
   installedVersion?: { version: string; releaseTag?: string }
+  llamaCppStandardArtifactReady?: boolean
+  llamaCppPhisonArtifactReady?: boolean
+  llamaCppStandardInstalledVersion?: { version: string; releaseTag?: string }
+  llamaCppPhisonInstalledVersion?: { version: string; releaseTag?: string }
+}
+
+type StorageTarget = {
+  id: string
+  name: string
+  path: string
+  selected: boolean
 }
 
 type Model = {

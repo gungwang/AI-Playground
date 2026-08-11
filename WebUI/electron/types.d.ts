@@ -5,6 +5,8 @@ declare type BackendServiceName =
   | 'comfyui-backend'
   | 'llamacpp-backend'
   | 'openvino-backend'
+  | 'home-agent-backend'
+  | 'qwen3-tts-backend'
 
 // Declare BackendStatus type
 declare type BackendStatus =
@@ -40,6 +42,16 @@ declare interface InferenceDevice {
   id: string
   name: string
   selected: boolean
+  /** Stable vendor UUID when the backend can supply one; used to re-identify a
+   *  device across driver/enumeration changes. undefined/null when unavailable. */
+  uuid?: string | null
+}
+
+declare type StorageTarget = {
+  id: string
+  name: string
+  path: string
+  selected: boolean
 }
 
 declare interface ErrorDetails {
@@ -61,9 +73,16 @@ declare interface ApiServiceInformation {
   isSetUp: boolean
   isRequired: boolean
   devices: InferenceDevice[]
+  storageTargets?: StorageTarget[]
+  llamaCppSsdOffloadConfigPath?: string
   sttDevices?: InferenceDevice[]
   errorDetails: ErrorDetails | null
   installedVersion?: { version: string; releaseTag?: string }
+  /** Populated by llamacpp-backend: GGUF tree under llama-cpp/ */
+  llamaCppStandardArtifactReady?: boolean
+  llamaCppPhisonArtifactReady?: boolean
+  llamaCppStandardInstalledVersion?: { version: string; releaseTag?: string }
+  llamaCppPhisonInstalledVersion?: { version: string; releaseTag?: string }
 }
 
 // Declare ComfyUICustomNodeRepoId type

@@ -2,6 +2,7 @@ import { acceptHMRUpdate, defineStore } from 'pinia'
 import { demoAwareStorage } from '../demoAwareStorage'
 import { LlmBackend } from './textInference'
 import { useBackendServices } from './backendServices'
+import { aipgFetch } from '@/lib/loopbackAuth'
 
 export type ModelPaths = {
   ggufLLM: string
@@ -22,10 +23,13 @@ export type Model = {
   type: ModelType
   backend?: LlmBackend
   supportsToolCalling?: boolean
+  toolParser?: string // OVMS --tool_parser override; defaults to 'hermes3'
   supportsVision?: boolean
   supportsReasoning?: boolean
+  supportsThinkingToggle?: boolean // Template honors enable_thinking toggle (Qwen3 family, gemma4)
   maxContextSize?: number
   npuSupport?: boolean
+  largeMoe?: boolean // Large Mixture-of-Experts model; Phison aiDAPTIV+ SSD offload enables loading models larger than VRAM
   isPredefined?: boolean // true if model is defined in models.json
 }
 
@@ -136,8 +140,10 @@ export const useModels = defineStore(
             supportsToolCalling: combinedModel.supportsToolCalling,
             supportsVision: combinedModel.supportsVision ?? (mmproj ? true : undefined),
             supportsReasoning: combinedModel.supportsReasoning,
+            supportsThinkingToggle: combinedModel.supportsThinkingToggle,
             maxContextSize: combinedModel.maxContextSize,
             npuSupport: combinedModel.npuSupport,
+            largeMoe: combinedModel.largeMoe,
             isPredefined: !!predefinedModel, // true if model is defined in models.json
           }
           return model
@@ -157,6 +163,7 @@ export const useModels = defineStore(
           supportsToolCalling: model.supportsToolCalling,
           supportsVision: model.supportsVision,
           supportsReasoning: model.supportsReasoning,
+          supportsThinkingToggle: model.supportsThinkingToggle,
           maxContextSize: model.maxContextSize,
           npuSupport: model.npuSupport,
         }
@@ -174,7 +181,26 @@ export const useModels = defineStore(
     }
 
     async function checkIfHuggingFaceUrlExists(repo_id: string) {
-      const response = await fetch(`${aipgBackendUrl()}/api/checkHFRepoExists?repo_id=${repo_id}`)
+      // Forward the user's HF token (if configured) so the backend can resolve
+      // private/gated repos. The Authorization Bearer header is the same
+      // convention used by /api/downloadModel for the HF token.
+      const headers: HeadersInit = hfToken.value?.startsWith('hf_')
+        ? { Authorization: `Bearer ${hfToken.value}` }
+        : {}
+      const response = await aipgFetch(
+        `${aipgBackendUrl()}/api/checkHFRepoExists?repo_id=${encodeURIComponent(repo_id)}`,
+        { headers },
+      )
+      // 503 = backend could not reach Hugging Face (timeout/connection error).
+      // This is NOT the same as "repo does not exist"; throw so callers report
+      // a connectivity problem instead of silently treating the model as
+      // missing (falsy `exists`) and aborting with a misleading message.
+      if (response.status === 503) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(
+          `Could not reach Hugging Face to verify ${repo_id}. Check the machine's network/proxy connectivity to huggingface.co and try again. (${data.message ?? 'read timeout'})`,
+        )
+      }
       const data = await response.json()
       return data.exists
     }
@@ -246,6 +272,13 @@ export const useModels = defineStore(
           // STT path for openvino transcription models
           return pathsToUse['STT'] || ''
         }
+        if (type === 'TTS') {
+          // TTS path for openvino text-to-speech models
+          return pathsToUse['TTS'] || ''
+        }
+        if (type === 'openvino-image') {
+          return pathsToUse['openvino-image'] || ''
+        }
       }
 
       // Fallback: try to find by type directly
@@ -289,6 +322,81 @@ export const useModels = defineStore(
           model_path: modelPath,
         },
       ]
+    }
+
+    /**
+     * Check if a speech (TTS) model exists
+     * @param modelName - The model name (e.g., 'microsoft/speecht5_tts')
+     * @returns Promise<boolean> - True if model exists
+     */
+    async function checkSpeechModelExists(modelName: string): Promise<boolean> {
+      const checkParams = [
+        {
+          repo_id: modelName,
+          type: 'TTS',
+          backend: 'openvino' as const,
+        },
+      ]
+      const results = await checkModelAlreadyLoaded(checkParams)
+      return results.length > 0 && results[0].already_loaded
+    }
+
+    /**
+     * Get missing speech (TTS) model download parameters
+     * @param modelName - The model name (e.g., 'microsoft/speecht5_tts')
+     * @returns Promise<DownloadModelParam[]> - Array with model if missing, empty if exists
+     */
+    async function getMissingSpeechModel(modelName: string): Promise<DownloadModelParam[]> {
+      const exists = await checkSpeechModelExists(modelName)
+      if (exists) {
+        return []
+      }
+
+      const modelPath = getModelPath('TTS', 'openvino')
+      return [
+        {
+          repo_id: modelName,
+          type: 'TTS',
+          backend: 'openvino',
+          model_path: modelPath,
+        },
+      ]
+    }
+
+    /**
+     * Check if a Qwen3-TTS model repo exists on disk. The Qwen weights live in the
+     * shared TTS model directory (same as the OpenVINO speech model) and are loaded
+     * locally by the qwen3-tts sidecar.
+     */
+    async function checkQwenTtsModelExists(repoId: string): Promise<boolean> {
+      const results = await checkModelAlreadyLoaded([
+        {
+          repo_id: repoId,
+          type: 'TTS',
+          backend: 'openvino' as const,
+        },
+      ])
+      return results.length > 0 && results[0].already_loaded
+    }
+
+    /**
+     * Return download params for whichever of the given Qwen3-TTS repos are missing,
+     * ready to hand to `showDownloadDialog` (the standard model-download popup).
+     */
+    async function getMissingQwenTtsModels(repoIds: string[]): Promise<DownloadModelParam[]> {
+      const modelPath = getModelPath('TTS', 'openvino')
+      const missing: DownloadModelParam[] = []
+      for (const repoId of repoIds) {
+        if (!(await checkQwenTtsModelExists(repoId))) {
+          missing.push({
+            repo_id: repoId,
+            type: 'TTS',
+            backend: 'openvino',
+            model_path: modelPath,
+          })
+        }
+      }
+      return missing
     }
 
     /**
@@ -377,7 +485,7 @@ export const useModels = defineStore(
         model_path: getModelPath(param.type, param.backend),
       }))
 
-      const response = await fetch(`${aipgBackendUrl()}/api/checkModelAlreadyLoaded`, {
+      const response = await aipgFetch(`${aipgBackendUrl()}/api/checkModelAlreadyLoaded`, {
         method: 'POST',
         body: JSON.stringify({ data: paramsWithPaths }),
         headers: {
@@ -403,6 +511,10 @@ export const useModels = defineStore(
       hfEndpoint,
       checkTranscriptionModelExists,
       getMissingTranscriptionModel,
+      checkSpeechModelExists,
+      getMissingSpeechModel,
+      checkQwenTtsModelExists,
+      getMissingQwenTtsModels,
       hfTokenIsValid: computed(() => hfToken.value?.startsWith('hf_')),
       hfEndpointIsValid: computed(() => isValidUrl(hfEndpoint.value)),
       verifyHfEndpoint,

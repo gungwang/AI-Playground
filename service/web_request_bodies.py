@@ -1,5 +1,3 @@
-from typing import List, Optional
-
 import marshmallow_dataclass
 from marshmallow import EXCLUDE
 
@@ -8,31 +6,14 @@ from marshmallow import EXCLUDE
 class DownloadModelData:
     class Meta:
         unknown = EXCLUDE
-    type : str
-    repo_id : str
-    backend : str
-    model_path : str
-    additionalLicenseLink: Optional[str]
+
+    type: str
+    repo_id: str
+    backend: str
+    model_path: str
+    additionalLicenseLink: str | None
+
 
 @marshmallow_dataclass.dataclass
 class DownloadModelRequestBody:
-    data : List[DownloadModelData]
-
-@marshmallow_dataclass.dataclass
-class ComfyUICustomNodesGithubRepoId:
-    username: str
-    repoName: str
-    gitRef: Optional[str]
-
-@marshmallow_dataclass.dataclass
-class ComfyUICustomNodesDownloadRequest:
-    data : List[ComfyUICustomNodesGithubRepoId]
-
-@marshmallow_dataclass.dataclass
-class ComfyUICheckWorkflowRequirementRequest:
-    pythonPackages : List[str]
-    customNodes : List[ComfyUICustomNodesGithubRepoId]
-
-@marshmallow_dataclass.dataclass
-class ComfyUIPackageInstallRequest:
-    data : List[str]
+    data: list[DownloadModelData]

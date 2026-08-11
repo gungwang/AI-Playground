@@ -66,6 +66,7 @@
       <LoadImageWithPreview
         v-if="input.type === 'image' && hasMaskEditing"
         :id="`${input.nodeTitle}.${input.nodeInput}`"
+        :label="languages[getTranslationLabel('SETTINGS_IMAGE_COMFY_', input.label)] ?? input.label"
         :image-url-ref="input.current as WritableComputedRef<string>"
         :disabled="!isModifiable(input)"
         @image-loaded="handleImageLoaded"
@@ -75,6 +76,7 @@
       <LoadImage
         v-else-if="input.type === 'image'"
         :id="`${input.nodeTitle}.${input.nodeInput}`"
+        :label="languages[getTranslationLabel('SETTINGS_IMAGE_COMFY_', input.label)] ?? input.label"
         :image-url-ref="input.current as WritableComputedRef<string>"
         :disabled="!isModifiable(input)"
         @image-loaded="handleImageLoaded"
@@ -218,10 +220,13 @@ const isModifiable = (input: (typeof imageGeneration.comfyInputs)[0]) => {
   return input.modifiable !== false
 }
 
-// Check if current preset has mask editing (inpaint or outpaint)
+// Inpaint / outpaint canvas UI: explicit types, or Comfy-driven outpaint (OVMS uses OutpaintDirection without outpaintCanvas)
 const hasMaskEditing = computed(() => {
   return imageGeneration.comfyInputs.some(
-    (input) => input.type === 'inpaintMask' || input.type === 'outpaintCanvas',
+    (input) =>
+      input.type === 'inpaintMask' ||
+      input.type === 'outpaintCanvas' ||
+      (input.nodeTitle === 'OutpaintDirection' && input.nodeInput === 'left'),
   )
 })
 

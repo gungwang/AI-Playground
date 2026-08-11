@@ -9,5 +9,8 @@
   "demoModePasscode": "0451",
   "languageOverride": null,
   "remoteRepository": "gungwang/AI-Playground",
-  "huggingfaceEndpoint": "https://huggingface.co"
+  "huggingfaceEndpoint": "https://huggingface.co",
+  "openvinoImageGenDevices": ["CPU", "GPU"],
+  "isHomeAgentEnabled": true,
+  "isQwen3TtsEnabled": true
 }

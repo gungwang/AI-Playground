@@ -14,7 +14,7 @@
     class="main-title text-2xl font-bold flex justify-between items-center px-4 border-b border-border/20 text-foreground bg-background/20"
     :class="{ 'bg-muted/50': theme.active === 'light' }"
   >
-    <div class="flex items-center">
+    <div class="flex items-center gap-4">
       <h1 class="select-none flex gap-2 items-baseline">
         <span class="text-[#00c4fa]">GUNGWANG</span>
         <span>AI PLAYGROUND</span>
@@ -28,6 +28,14 @@
       <DemoModeIndicator />
     </div>
     <div class="flex justify-between items-center gap-5">
+      <HomeAgentToggle
+        v-if="
+          homeAgent.isFeatureEnabled &&
+          globalSetup.loadingState === 'running' &&
+          (promptStore.getCurrentMode() === 'chat' || promptStore.getCurrentMode() === 'imageGen')
+        "
+        class="self-center"
+      />
       <button
         v-if="debugToolsEnabled"
         :title="languages.COM_SETTINGS"
@@ -45,20 +53,19 @@
       >
         <ServerStackIcon class="size-6 text-foreground"></ServerStackIcon>
       </button>
-      <div
-        id="demo-buttons-group"
-        v-if="demoMode.enabled && globalSetup.loadingState === 'running'"
-        class="flex gap-2"
+      <button
+        v-if="globalSetup.loadingState === 'running'"
+        id="contextual-help-toggle"
+        type="button"
+        class="flex size-7 items-center justify-center rounded-full border border-border text-sm font-bold text-foreground transition-colors hover:bg-muted"
+        :class="{ 'bg-primary text-primary-foreground border-primary': contextualHelp.active }"
+        title="What's this? Click, then click a control to learn about it."
+        aria-label="Toggle help mode"
+        :aria-pressed="contextualHelp.active"
+        @click="contextualHelp.toggle()"
       >
-        <button
-          id="demo-need-help-button"
-          class="bg-demo-button text-white px-3 rounded text-xs cursor-pointer"
-          style="height: 30px; min-width: 90px"
-          @click="triggerHelpForCurrentMode(true)"
-        >
-          {{ languages.DEMO_NEED_HELP }}
-        </button>
-      </div>
+        ?
+      </button>
       <button
         v-if="!demoMode.enabled"
         :title="languages.COM_MINI"
@@ -165,12 +172,12 @@
     <SideModalAppSettings :isVisible="showAppSettings" @close="showAppSettings = false" />
 
     <div class="flex-1 flex flex-col relative justify-center min-h-0">
-      <div class="fixed top-18 left-4 z-5">
+      <div class="fixed top-18 left-4 z-5 flex flex-col gap-2">
         <button
           id="show-history-button"
           v-show="!uiStore.showHistory"
           @click="openHistory"
-          class="text-foreground px-3 py-1.5 bg-muted hover:bg-muted/80 rounded-lg text-sm"
+          class="text-foreground px-3 py-1.5 bg-card border border-border shadow-sm hover:bg-muted rounded-lg text-sm"
         >
           {{ languages.COM_SHOW_HISTORY }}
         </button>
@@ -235,10 +242,14 @@
     ></installation-progress-dialog>
     <MaskEditorDialog />
 
+    <!-- Dev-only Home Agent mock channel for e2e testing -->
+    <MockChannelPanel v-if="debugToolsEnabled" />
+
     <!-- Demo Mode Overlay -->
     <DemoModeOverlayDriverJsRef ref="demoModeOverlayDriverJs" />
     <DemoModeNotificationDots />
     <DemoModeAutoresetDialog v-if="demoMode.showResetDialog" />
+    <ContextualHelpLayer />
   </main>
 
   <footer
@@ -325,15 +336,22 @@ import DemoModeOverlayDriverJsRef from './components/DemoModeOverlayDriverJs.vue
 import DemoModeBlocker from '@/components/DemoModeBlocker.vue'
 import DemoModeNotificationDots from '@/components/DemoModeNotificationDots.vue'
 import DemoModeAutoresetDialog from '@/components/DemoModeAutoresetDialog.vue'
+import HomeAgentToggle from '@/components/HomeAgentToggle.vue'
+import MockChannelPanel from '@/components/MockChannelPanel.vue'
+import { useHomeAgent } from '@/assets/js/store/homeAgent'
+import ContextualHelpLayer from '@/components/ContextualHelpLayer.vue'
+import { useContextualHelp } from '@/assets/js/store/contextualHelp'
 
 const theme = useTheme()
 const globalSetup = useGlobalSetup()
 const productModeStore = useProductMode()
 const demoMode = useDemoMode()
+const contextualHelp = useContextualHelp()
 const dialogStore = useDialogStore()
 const promptStore = usePromptStore()
 const uiStore = useUIStore()
 const setupWizardStore = useSetupWizard()
+const homeAgent = useHomeAgent()
 
 const addLLMCompt = ref<InstanceType<typeof AddLLMDialog>>()
 const demoModeOverlayDriverJs = ref<InstanceType<typeof DemoModeOverlayDriverJsRef>>()
@@ -481,14 +499,6 @@ function openAppSettings() {
   showAppSettings.value = true
 }
 
-function triggerHelpForCurrentMode(_force = false) {
-  demoModeOverlayDriverJs.value?.triggerContextHelp?.(
-    promptStore.getCurrentMode(),
-    showAppSettings.value,
-    showSpecificSettings.value,
-  )
-}
-
 function startTour() {
   demoModeOverlayDriverJs.value?.startTour?.()
 }
@@ -498,7 +508,7 @@ watch(
   (state) => {
     if (state === 'running' && demoMode.enabled) {
       void demoMode.applyExplicitDefaults()
-      setTimeout(() => startTour(), 2200)
+      window.setTimeout(startTour, 2200)
     }
   },
 )

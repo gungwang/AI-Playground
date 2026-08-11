@@ -9,6 +9,7 @@ import { useDialogStore } from './dialogs'
 import { useI18N } from './i18n'
 import { useDemoMode } from './demoMode'
 import { useSetupWizard } from './setupWizard'
+import { useErrors } from './errors'
 
 /**
  * Maps a preset to its corresponding UI mode based on type and category.
@@ -38,6 +39,8 @@ function presetToMode(preset: Preset): ModeType {
 const backendToService = {
   llamaCPP: 'llamacpp-backend',
   openVINO: 'openvino-backend',
+  // Cloud Mode is a remote backend with no local service.
+  cloud: null,
 } as const
 
 type LlmBackend = keyof typeof backendToService
@@ -98,6 +101,11 @@ export type PresetSwitchOptions = {
   skipModeSwitch?: boolean
   /** Don't update last-used tracking */
   skipLastUsedUpdate?: boolean
+  /**
+   * Skip high-memory / video VRAM confirmation (e.g. LLM tool calls that temporarily
+   * switch presets must not block on a modal).
+   */
+  skipMemoryAlert?: boolean
 }
 
 export const usePresetSwitching = defineStore('presetSwitching', () => {
@@ -108,6 +116,7 @@ export const usePresetSwitching = defineStore('presetSwitching', () => {
   const i18nState = useI18N().state
   const demoMode = useDemoMode()
   const setupWizard = useSetupWizard()
+  const errors = useErrors()
 
   // Switching state
   const isSwitching = ref(false)
@@ -186,8 +195,10 @@ export const usePresetSwitching = defineStore('presetSwitching', () => {
         throw new Error(`Preset not found: ${presetName}`)
       }
 
-      // 2. For chat presets, verify backend availability
-      if (preset.type === 'chat') {
+      // 2. For chat presets, verify backend availability. A TTS preset has no LLM
+      //    backend (it drives Qwen3-TTS directly), so it can always be selected —
+      //    readiness is surfaced later as an install banner in the settings panel.
+      if (preset.type === 'chat' && !(preset as ChatPreset).ttsPreset) {
         const chatPreset = preset as ChatPreset
         const hasAvailableBackend = chatPreset.backends.some((b) => isBackendAvailable(b))
 
@@ -203,7 +214,10 @@ export const usePresetSwitching = defineStore('presetSwitching', () => {
         preset.type === 'comfy' &&
         (HIGH_MEMORY_PRESETS.has(presetName) || VIDEO_VRAM_PRESETS.has(presetName))
       const shouldShowMemoryAlert =
-        isGatedMemoryPreset && !isMemoryAlertSuppressed(presetName) && !demoMode.enabled
+        isGatedMemoryPreset &&
+        !isMemoryAlertSuppressed(presetName) &&
+        !demoMode.enabled &&
+        !options.skipMemoryAlert
 
       if (shouldShowMemoryAlert) {
         const message = HIGH_MEMORY_PRESETS.has(presetName)
@@ -226,10 +240,15 @@ export const usePresetSwitching = defineStore('presetSwitching', () => {
       console.log(`[PresetSwitching] Successfully switched to preset: ${presetName}`)
       return { success: true }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
-      console.error(`[PresetSwitching] Failed to switch preset: ${errorMessage}`)
-      switchError.value = errorMessage
-      return { success: false, error: errorMessage }
+      const reported = errors.report(error, {
+        category: 'setup',
+        code: 'preset/switch-failed',
+        userMessage: 'Could not switch preset.',
+        surface: 'toast',
+        context: { presetName },
+      })
+      switchError.value = reported.technicalMessage
+      return { success: false, error: reported.technicalMessage }
     } finally {
       isSwitching.value = false
       switchingPresetName.value = null

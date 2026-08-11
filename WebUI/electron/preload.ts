@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startDrag: (fileName: string) => ipcRenderer.send('ondragstart', fileName),
   getFilePath: (file: File) => webUtils.getPathForFile(file),
   getServices: () => ipcRenderer.invoke('getServices'),
+  getBackendAuthToken: (serviceName: string) =>
+    ipcRenderer.invoke('getBackendAuthToken', serviceName),
   updateServiceSettings: (settings: ServiceSettings) =>
     ipcRenderer.invoke('updateServiceSettings', settings),
   uninstall: (serviceName: string) => ipcRenderer.invoke('uninstall', serviceName),
@@ -65,6 +67,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   reportClientEvent: (eventId: number) => ipcRenderer.send('reportClientEvent', eventId),
   saveImage: (url: string) => ipcRenderer.send('saveImage', url),
   saveImageToMediaInput: (dataUri: string) => ipcRenderer.invoke('saveImageToMediaInput', dataUri),
+  saveGeneratedAudio: (audioBase64: string, filename: string) =>
+    ipcRenderer.invoke('saveGeneratedAudio', audioBase64, filename),
+  readLocalAudioAsDataUri: (filePath: string) =>
+    ipcRenderer.invoke('readLocalAudioAsDataUri', filePath),
+  readAipgMediaAsBase64: (url: string) => ipcRenderer.invoke('readAipgMediaAsBase64', url),
   wakeupApiService: () => ipcRenderer.send('wakeupApiService'),
   openImageWin: (url: string, title: string, width: number, height: number) =>
     ipcRenderer.send('openImageWin', url, title, width, height),
@@ -82,14 +89,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('embedInputUsingRag', embedInquiry),
   getEmbeddingServerUrl: (serviceName: string) =>
     ipcRenderer.invoke('getEmbeddingServerUrl', serviceName),
+  ensureEmbeddingServerReady: (serviceName: string, embeddingModelName: string) =>
+    ipcRenderer.invoke('ensureEmbeddingServerReady', serviceName, embeddingModelName),
   getInitSetting: () => ipcRenderer.invoke('getInitSetting'),
   updateModelPaths: (modelPaths: ModelPaths) => ipcRenderer.invoke('updateModelPaths', modelPaths),
   restorePathsSettings: () => ipcRenderer.invoke('restorePathsSettings'),
-  refreshLLMModles: () => ipcRenderer.invoke('refreshLLMModles'),
   loadModels: () => ipcRenderer.invoke('loadModels'),
   zoomIn: () => ipcRenderer.invoke('zoomIn'),
   zoomOut: () => ipcRenderer.invoke('zoomOut'),
-  getDownloadedLLMs: () => ipcRenderer.invoke('getDownloadedLLMs'),
   getDownloadedGGUFLLMs: () => ipcRenderer.invoke('getDownloadedGGUFLLMs'),
   getDownloadedOpenVINOLLMModels: () => ipcRenderer.invoke('getDownloadedOpenVINOLLMModels'),
   getDownloadedEmbeddingModels: () => ipcRenderer.invoke('getDownloadedEmbeddingModels'),
@@ -103,6 +110,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wakeupComfyUIService: () => ipcRenderer.send('wakeupComfyUIService'),
   getComfyUiDefaultParameters: () => ipcRenderer.invoke('getComfyUiDefaultParameters'),
   getLlamaCppDefaultParameters: () => ipcRenderer.invoke('getLlamaCppDefaultParameters'),
+  detectPhisonSsd: () => ipcRenderer.invoke('detectPhisonSsd') as Promise<{ detected: boolean }>,
   onServiceSetUpProgress: (callback: (data: SetupProgress) => void) =>
     ipcRenderer.on('serviceSetUpProgress', (_event, value) => callback(value)),
   onServiceInfoUpdate: (callback: (service: ApiServiceInformation) => void) =>
@@ -127,6 +135,33 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('startTranscriptionServer', modelName),
   stopTranscriptionServer: () => ipcRenderer.invoke('stopTranscriptionServer'),
   getTranscriptionServerUrl: () => ipcRenderer.invoke('getTranscriptionServerUrl'),
+  startSpeechServer: (modelName: string) => ipcRenderer.invoke('startSpeechServer', modelName),
+  stopSpeechServer: () => ipcRenderer.invoke('stopSpeechServer'),
+  getSpeechServerUrl: () => ipcRenderer.invoke('getSpeechServerUrl'),
+  synthesizeSpeech: (options: {
+    baseURL: string
+    model: string
+    input: string
+    voice?: string
+    apiKey?: string
+    format?: string
+  }) => ipcRenderer.invoke('synthesizeSpeech', options),
+  ensureOvmsImageReady: (
+    serviceName: string,
+    modelName: string,
+    keepModelsLoaded?: boolean,
+    resolution?: string,
+  ) =>
+    ipcRenderer.invoke(
+      'ensureOvmsImageReady',
+      serviceName,
+      modelName,
+      keepModelsLoaded,
+      resolution,
+    ),
+  stopOvmsImageServer: () => ipcRenderer.invoke('stopOvmsImageServer'),
+  stopOvmsChatServers: () => ipcRenderer.invoke('stopOvmsChatServers'),
+  getOvmsImageServerUrl: () => ipcRenderer.invoke('getOvmsImageServerUrl'),
   // ComfyUI Tools
   comfyui: {
     isGitInstalled: () => ipcRenderer.invoke('comfyui:isGitInstalled'),
@@ -143,6 +178,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     uninstallCustomNode: (nodeRepoData: ComfyUICustomNodeRepoId) =>
       ipcRenderer.invoke('comfyui:uninstallCustomNode', nodeRepoData),
     listInstalledCustomNodes: () => ipcRenderer.invoke('comfyui:listInstalledCustomNodes'),
+    openInBrowser: () => ipcRenderer.invoke('comfyui:openInBrowser'),
   },
   mcp: {
     listServers: () => ipcRenderer.invoke('mcp:listServers'),
@@ -158,16 +194,115 @@ contextBridge.exposeInMainWorld('electronAPI', {
     addServer: (
       serverId: string,
       config:
-        | { type?: 'stdio'; command: string; args?: string[]; displayName?: string }
-        | { type: 'http'; url: string; headers?: Record<string, string>; displayName?: string },
+        | {
+            type?: 'stdio'
+            command: string
+            args?: string[]
+            displayName?: string
+            instructions?: string
+          }
+        | {
+            type: 'http'
+            url: string
+            headers?: Record<string, string>
+            displayName?: string
+            instructions?: string
+          },
     ) => ipcRenderer.invoke('mcp:addServer', serverId, config),
     getServerConfig: (serverId: string) => ipcRenderer.invoke('mcp:getServerConfig', serverId),
     updateServer: (
       serverId: string,
       config:
-        | { type?: 'stdio'; command: string; args?: string[]; displayName?: string }
-        | { type: 'http'; url: string; headers?: Record<string, string>; displayName?: string },
+        | {
+            type?: 'stdio'
+            command: string
+            args?: string[]
+            displayName?: string
+            instructions?: string
+          }
+        | {
+            type: 'http'
+            url: string
+            headers?: Record<string, string>
+            displayName?: string
+            instructions?: string
+          },
     ) => ipcRenderer.invoke('mcp:updateServer', serverId, config),
     removeServer: (serverId: string) => ipcRenderer.invoke('mcp:removeServer', serverId),
+  },
+  webBrowser: {
+    navigate: (url: string) => ipcRenderer.invoke('webBrowser:navigate', url),
+    readPage: () => ipcRenderer.invoke('webBrowser:readPage'),
+    search: (query: string, maxResults?: number) =>
+      ipcRenderer.invoke('webBrowser:search', query, maxResults),
+    interact: (interaction: WebBrowserInteraction) =>
+      ipcRenderer.invoke('webBrowser:interact', interaction),
+    screenshot: () => ipcRenderer.invoke('webBrowser:screenshot'),
+    show: () => ipcRenderer.invoke('webBrowser:show'),
+    hide: () => ipcRenderer.invoke('webBrowser:hide'),
+    close: () => ipcRenderer.invoke('webBrowser:close'),
+    getState: () => ipcRenderer.invoke('webBrowser:getState'),
+    onStateChanged: (callback: (state: WebBrowserState) => void) =>
+      ipcRenderer.on('webBrowser:stateChanged', (_event, state: WebBrowserState) =>
+        callback(state),
+      ),
+  },
+  screenshot: {
+    listWindows: () => ipcRenderer.invoke('screenshot:listWindows'),
+    captureWindow: (target: { id: string; name: string }) =>
+      ipcRenderer.invoke('screenshot:captureWindow', target),
+    getPermissionStatus: () => ipcRenderer.invoke('screenshot:getPermissionStatus'),
+    openPermissionSettings: () => ipcRenderer.send('screenshot:openPermissionSettings'),
+  },
+  homeAgent: {
+    // Persist an inbound document (base64) to disk for RAG ingestion.
+    saveDocument: (filename: string, base64: string) =>
+      ipcRenderer.invoke('saveHomeAgentDocument', filename, base64),
+    // Channel-agnostic dispatcher. Every method is keyed by ChannelKind
+    // (`'telegram'` | `'slack'` | `'discord'`) so adding a new platform
+    // requires zero edits here — only a new entry in the renderer-side
+    // channel registry and a Python channel module.
+    channel: {
+      saveConfig: (kind: string, config: Record<string, string>) =>
+        ipcRenderer.invoke('channel:saveConfig', kind, config),
+      loadConfig: (kind: string) => ipcRenderer.invoke('channel:loadConfig', kind),
+      clearConfig: (kind: string) => ipcRenderer.invoke('channel:clearConfig', kind),
+      savePrefs: (kind: string, prefs: { verified?: boolean; enabled?: boolean }) =>
+        ipcRenderer.invoke('channel:savePrefs', kind, prefs),
+      loadPrefs: (kind: string) => ipcRenderer.invoke('channel:loadPrefs', kind),
+      test: (kind: string) => ipcRenderer.invoke('channel:test', kind),
+      inject: (kind: string, config: Record<string, string | undefined>) =>
+        ipcRenderer.invoke('channel:inject', kind, config),
+      detectIdentity: (kind: string, config: Record<string, string | undefined>) =>
+        ipcRenderer.invoke('channel:detectIdentity', kind, config),
+      detectIdentityFromSaved: (kind: string) =>
+        ipcRenderer.invoke('channel:detectIdentityFromSaved', kind),
+      poll: (kind: string) => ipcRenderer.invoke('channel:poll', kind),
+      flushPending: (kind: string) => ipcRenderer.invoke('channel:flushPending', kind),
+      send: (
+        kind: string,
+        action:
+          | 'reply'
+          | 'update'
+          | 'photo'
+          | 'video'
+          | 'voice'
+          | 'document'
+          | 'typing'
+          | 'keyboard'
+          | 'editMessage',
+        payload: Record<string, unknown>,
+      ) => ipcRenderer.invoke('channel:send', kind, action, payload),
+    },
+  },
+  // Cloud Mode provider secrets, encrypted at rest via safeStorage in main.
+  cloudProvider: {
+    saveKey: (providerId: string, key: string): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('cloudProvider:saveKey', providerId, key),
+    getKey: (providerId: string): Promise<string | null> =>
+      ipcRenderer.invoke('cloudProvider:getKey', providerId),
+    deleteKey: (providerId: string): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('cloudProvider:deleteKey', providerId),
+    getProxyUrl: (): Promise<string> => ipcRenderer.invoke('cloudProvider:getProxyUrl'),
   },
 })

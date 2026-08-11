@@ -31,12 +31,8 @@ def get_added_dll_directories():
 try:
     import sys
 
-    import comfyui_downloader
     from web_request_bodies import (
-        ComfyUICheckWorkflowRequirementRequest,
         DownloadModelRequestBody,
-        ComfyUICustomNodesDownloadRequest,
-        ComfyUIPackageInstallRequest,
     )
 
     # Credit to https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/14186
@@ -55,30 +51,133 @@ try:
 
     import os
     import threading
-    from flask import jsonify, request, Response, stream_with_context
+
     from apiflask import APIFlask
+    from flask import Response, jsonify, request, stream_with_context
+
+    # Shared loopback-auth lives in a sibling backend_shared/ directory so the
+    # same logic is used by every local Python backend (see backend_shared/).
+    sys.path.insert(
+        0,
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "backend_shared"
+        ),
+    )
+    import logging
+    import traceback
 
     import model_download_adpater
     import utils
+    from aipg_loopback_auth import (
+        evaluate_loopback_auth,
+        get_loopback_token,
+    )
+    from exceptions import HFReachabilityError
     from model_downloader import HFPlaygroundDownloader
     from psutil._common import bytes2human
-    import traceback
-    import logging
 
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
     app = APIFlask(__name__)
 
+    # Per-launch loopback auth token, passed in by the AI Playground Electron
+    # main process via env var. Without this, the local 127.0.0.1:5xxxx port
+    # would be reachable by any other process on the box (including low-IL
+    # processes and host-networked containers), which is the attack model
+    # documented in the CWE-494 report against /api/comfyUi/loadCustomNodes.
+    _LOOPBACK_AUTH_TOKEN = get_loopback_token()
+    # Loopback hostnames whose Origin we are willing to echo back as
+    # Access-Control-Allow-Origin. The renderer may load via 127.0.0.1 or
+    # localhost depending on platform/devtools; production Electron loads
+    # from file:// which the browser sends as `Origin: null`.
+    _ALLOWED_CORS_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+    if not _LOOPBACK_AUTH_TOKEN:
+        logging.warning(
+            "AIPG_LOOPBACK_TOKEN env var is not set; ai-backend will reject all "
+            "non-/healthy requests. Start the service via the AI Playground "
+            "Electron main process so the token is provisioned."
+        )
+
+    def _origin_is_loopback(origin: str) -> bool:
+        """True for `null`, `file://...`, or any http(s) URL whose host is a
+        loopback host. Used to decide whether we are willing to echo the
+        request Origin back as Access-Control-Allow-Origin."""
+        if not origin:
+            return False
+        if origin == "null":
+            return True
+        if origin.startswith("file://"):
+            return True
+        # Strip scheme.
+        for scheme in ("http://", "https://"):
+            if origin.startswith(scheme):
+                rest = origin[len(scheme) :]
+                # Strip path component if any.
+                rest = rest.split("/", 1)[0]
+                # Strip port. IPv6 hosts come bracketed: `[::1]:1234`.
+                if rest.startswith("["):
+                    end = rest.find("]")
+                    if end < 0:
+                        return False
+                    host = rest[: end + 1]
+                else:
+                    host = rest.split(":", 1)[0]
+                return host in _ALLOWED_CORS_HOSTS
+        return False
+
+    @app.before_request
+    def _enforce_loopback_and_auth():
+        # Use a dedicated X-AIPG-Auth header so the existing
+        # `Authorization: Bearer <hf_token>` semantics for /api/downloadModel
+        # remain intact.
+        rejection = evaluate_loopback_auth(
+            request.remote_addr,
+            request.method,
+            request.path,
+            request.headers.get("X-AIPG-Auth", ""),
+            expected_token=_LOOPBACK_AUTH_TOKEN,
+        )
+        if rejection is not None:
+            status, message = rejection
+            if status == 403:
+                logging.warning(
+                    f"rejecting non-loopback request from {request.remote_addr} to {request.path}"
+                )
+            return jsonify({"error": message}), status
+        # CORS preflight requests do NOT carry the X-AIPG-Auth header by
+        # design (the browser strips custom headers from preflight). Reply
+        # 204 here and let _attach_cors_headers below add the actual CORS
+        # headers; the real request that follows will be authenticated.
+        if request.method == "OPTIONS":
+            return Response(status=204)
+        return None
+
+    @app.after_request
+    def _attach_cors_headers(response):
+        # The renderer fetch sends a custom `X-AIPG-Auth` header which makes
+        # the request "non-simple", so the browser issues a CORS preflight
+        # for every call. We only echo the Origin back when it is a known
+        # loopback origin; non-loopback origins get no Allow-Origin header
+        # and the browser blocks them.
+        origin = request.headers.get("Origin", "")
+        if origin and _origin_is_loopback(origin):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, DELETE, PUT, OPTIONS, PATCH"
+            )
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, Authorization, X-AIPG-Auth"
+            )
+            # Preflight result cached for 10 minutes; avoids repeated OPTIONS
+            # round-trips for typical short-lived API calls.
+            response.headers["Access-Control-Max-Age"] = "600"
+        return response
+
     @app.get("/healthy")
     def healthEndpoint():
         return jsonify({"health": "OK"})
-
-    @app.get("/api/applicationExit")
-    def applicationExit():
-        from signal import SIGINT
-
-        pid = os.getpid()
-        os.kill(pid, SIGINT)
 
     @app.post("/api/checkModelAlreadyLoaded")
     @app.input(
@@ -107,8 +206,25 @@ try:
     @app.get("/api/checkHFRepoExists")
     def check_if_huggingface_repo_exists():
         repo_id = request.args.get("repo_id")
-        downloader = HFPlaygroundDownloader()
-        exists = downloader.hf_url_exists(repo_id)
+        # Honor the user's HF token so private/gated repos that the user can
+        # actually access are reported as existing. Without this, the renderer
+        # would treat a private OVMS image repo as nonexistent and skip the
+        # download dialog entirely.
+        hf_token = get_bearer_token(request)
+        downloader = HFPlaygroundDownloader(hf_token=hf_token)
+        try:
+            exists = downloader.hf_url_exists(repo_id)
+        except HFReachabilityError as ex:
+            # Distinct from a genuine `exists: false`: we could not reach HF to
+            # check. Return 503 so the renderer surfaces a connectivity error
+            # instead of aborting generation as "model does not exist".
+            logging.error("checkHFRepoExists could not reach Hugging Face: %s", ex)
+            return jsonify(
+                {
+                    "error": "hf_unreachable",
+                    "message": str(ex),
+                }
+            ), 503
         return jsonify({"exists": exists})
 
     size_cache = dict()
@@ -216,7 +332,7 @@ try:
             traceback.print_exc()
 
             model_download_adpater._adapter.stop_download()
-            ex_str = '{{"type": "error", "err_type": "{}"}}'.format(e)
+            ex_str = f'{{"type": "error", "err_type": "{e}"}}'
             return Response(
                 stream_with_context([ex_str]), content_type="text/event-stream"
             )
@@ -226,102 +342,6 @@ try:
         if model_download_adpater._adapter is not None:
             model_download_adpater._adapter.stop_download()
         return jsonify({"code": 0, "message": "success"})
-
-    @app.post("/api/comfyUi/areCustomNodesLoaded")
-    @app.input(
-        ComfyUICustomNodesDownloadRequest.Schema,
-        location="json",
-        arg_name="comfyNodeRequest",
-    )
-    def are_custom_nodes_installed(comfyNodeRequest: ComfyUICustomNodesDownloadRequest):
-        response = {
-            f"{x.username}/{x.repoName}": comfyui_downloader.is_custom_node_installed_with_git_ref(
-                x
-            )
-            for x in comfyNodeRequest.data
-        }
-        return jsonify(response)
-
-    @app.post("/api/comfyUi/loadCustomNodes")
-    @app.input(
-        ComfyUICustomNodesDownloadRequest.Schema,
-        location="json",
-        arg_name="comfyNodeRequest",
-    )
-    def install_custom_nodes(comfyNodeRequest: ComfyUICustomNodesDownloadRequest):
-        try:
-            nodes_to_be_installed = [
-                x
-                for x in comfyNodeRequest.data
-                if not comfyui_downloader.is_custom_node_installed_with_git_ref(x)
-            ]
-            installation_result = [
-                {
-                    "node": f"{x.username}/{x.repoName}",
-                    "success": comfyui_downloader.download_custom_node(x),
-                }
-                for x in nodes_to_be_installed
-            ]
-            logging.info(
-                f"custom node installation request result: {installation_result}"
-            )
-            return jsonify(installation_result)
-        except Exception as e:
-            return jsonify(
-                {
-                    "error_message": f"failed to install at least one custom node due to {e}"
-                }
-            ), 501
-
-    @app.post("/api/comfyUi/installPythonPackage")
-    @app.input(
-        ComfyUIPackageInstallRequest.Schema,
-        location="json",
-        arg_name="comfyPackageInstallRequest",
-    )
-    def install_python_packages_for_comfy(
-        comfyPackageInstallRequest: ComfyUIPackageInstallRequest,
-    ):
-        try:
-            for package in comfyPackageInstallRequest.data:
-                comfyui_downloader.install_pypi_package(package)
-            return jsonify(
-                {
-                    f"{package}": {"success": True, "errorMessage": ""}
-                    for x in comfyPackageInstallRequest.data
-                }
-            )
-        except Exception as e:
-            return jsonify(
-                {"error_message": f"failed to at least one package due to {e}"}
-            ), 501
-
-    @app.post("/api/comfyUi/checkWorkflowRequirements")
-    @app.input(
-        ComfyUICheckWorkflowRequirementRequest.Schema,
-        location="json",
-        arg_name="comfyRequirementRequest",
-    )
-    def check_workflow_requirements(
-        comfyRequirementRequest: ComfyUICheckWorkflowRequirementRequest,
-    ):
-        try:
-            nodes_to_be_installed = [
-                not comfyui_downloader.is_custom_node_installed_with_git_ref(x)
-                for x in comfyRequirementRequest.customNodes
-            ]
-            packages_to_be_installed = [
-                not comfyui_downloader.is_package_installed(x)
-                for x in comfyRequirementRequest.pythonPackages
-            ]
-            needs_installation = any(nodes_to_be_installed) or any(
-                packages_to_be_installed
-            )
-            return jsonify({"needsInstallation": needs_installation})
-        except Exception as e:
-            return jsonify(
-                {"errorMessage": f"failed to check for installation {e}"}
-            ), 500
 
     if __name__ == "__main__":
         import argparse
@@ -334,10 +354,11 @@ try:
         app.run(host="127.0.0.1", port=args.port)
 
 except OSError as e:
+    import json
     import os
     import sys
+
     import psutil
-    import json
 
     info = {
         "errno": getattr(e, "errno", None),

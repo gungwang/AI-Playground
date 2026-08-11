@@ -4,7 +4,9 @@ import * as filesystem from 'fs-extra'
 import fsPromises from 'fs/promises'
 import path from 'node:path'
 import { appLoggerInstance } from '../logging/logger.ts'
+import { packagedResourcesRoot } from '../aipgRoot.ts'
 import { existingFileOrError, spawnProcessAsync, ProcessError } from './osProcessHelper'
+import { terminateProcessTree } from './processLifecycle.ts'
 import { assert } from 'node:console'
 import { createHash } from 'crypto'
 
@@ -139,7 +141,7 @@ export async function createEnhancedErrorDetails(
 }
 
 export const aipgBaseDir = () =>
-  app.isPackaged ? process.resourcesPath : path.join(__dirname, '../../../')
+  app.isPackaged ? packagedResourcesRoot() : path.join(__dirname, '../../../')
 
 export const aipgResourcesDir = () =>
   app.isPackaged ? aipgBaseDir() : path.join(aipgBaseDir(), 'build', 'resources')
@@ -292,7 +294,7 @@ abstract class ExecutableService extends GenericServiceImpl {
         exePath,
         args,
         (data) => this.log(data),
-        { ...extraEnv, PIP_CONFIG_FILE: 'nul' },
+        { ...extraEnv, PIP_CONFIG_FILE: process.platform === 'win32' ? 'nul' : '/dev/null' },
         workDir,
       )
     } catch (error) {
@@ -361,8 +363,13 @@ export class GitService extends ExecutableService {
 
   async install(): Promise<void> {
     if (process.platform !== 'win32') {
-      this.log('git installation not required on non-windows platform, skipping')
-      return
+      // On non-Windows we do not bundle a portable git; it must be provided by
+      // the OS. If check() failed and we reach here, git is genuinely missing,
+      // so fail loudly with an actionable message instead of silently skipping
+      // (which previously surfaced as a confusing downstream `git clone` error).
+      throw new Error(
+        'git not found. Install it with your package manager (Ubuntu: sudo apt-get install git) and retry setup.',
+      )
     }
     this.log('start installing')
 
@@ -376,11 +383,8 @@ export class GitService extends ExecutableService {
   }
 
   async repair(checkError: ServiceCheckError): Promise<void> {
-    if (process.platform !== 'win32') {
-      this.log('git repair not required on non-windows platform, skipping')
-      return
-    }
     assert(checkError.component === this.name)
+    // install() throws an actionable error on non-Windows (git is OS-provided).
     await this.install()
   }
 
@@ -440,7 +444,7 @@ export class GitService extends ExecutableService {
 export const aiBackendServiceDir = () =>
   path.resolve(
     app.isPackaged
-      ? path.join(process.resourcesPath, 'service')
+      ? path.join(packagedResourcesRoot(), 'service')
       : path.join(__dirname, '../../../service'),
   )
 
@@ -479,7 +483,7 @@ export abstract class LongLivedPythonApiService implements ApiService {
 
   encapsulatedProcess: ChildProcess | null = null
 
-  readonly baseDir = app.isPackaged ? process.resourcesPath : path.join(__dirname, '../../../')
+  readonly baseDir = app.isPackaged ? packagedResourcesRoot() : path.join(__dirname, '../../../')
   readonly wheelDir = path.join(
     app.isPackaged ? this.baseDir : path.join(__dirname, '../../external/'),
   )
@@ -501,6 +505,12 @@ export abstract class LongLivedPythonApiService implements ApiService {
   private startupLogBuffer: { stdout: string[]; stderr: string[] } = { stdout: [], stderr: [] }
   private isCapturingStartupLogs: boolean = false
   private startupStartTime: number = 0
+
+  // The in-flight startup promise. Two orchestrators (the main-process
+  // apiServiceRegistry and the renderer backendServices store) call start()
+  // concurrently on the same instance, so the second caller must await the same
+  // startup rather than throwing "Server startup already requested".
+  private startInFlight: Promise<BackendStatus> | null = null
 
   readonly appLogger = appLoggerInstance
 
@@ -604,10 +614,27 @@ export abstract class LongLivedPythonApiService implements ApiService {
       this.lastStartupErrorDetails = null
       return 'running'
     }
-    if (this.desiredStatus === 'running') {
-      throw new Error('Server startup already requested')
+    // A startup is already in flight (e.g. the main-process auto-start at boot
+    // racing a renderer-initiated start). This is idempotent, not an error:
+    // await the same in-flight result instead of throwing so it doesn't surface
+    // as a spurious "Server startup already requested" toast.
+    if (this.startInFlight) {
+      this.appLogger.info(
+        `start() called for ${this.name} while a startup is already in progress (status: ${this.currentStatus})`,
+        this.name,
+      )
+      return this.startInFlight
     }
 
+    this.startInFlight = this.runStartup()
+    try {
+      return await this.startInFlight
+    } finally {
+      this.startInFlight = null
+    }
+  }
+
+  private async runStartup(): Promise<BackendStatus> {
     this.desiredStatus = 'running'
     this.setStatus('starting')
 
@@ -628,6 +655,23 @@ export abstract class LongLivedPythonApiService implements ApiService {
         this.lastStartupErrorDetails = null
         // Stop capturing startup logs on success
         this.isCapturingStartupLogs = false
+        // Runtime crash detection: once running, a process exit we did not ask
+        // for means the backend died. Flip status to 'failed' and notify the
+        // renderer (serviceInfoUpdate) so in-flight work can be failed instead of
+        // hanging against a dead process. Intentional stop()s set
+        // desiredStatus = 'stopped' first, so those are ignored here.
+        const runningProcess = this.encapsulatedProcess
+        runningProcess?.once('exit', (code, signal) => {
+          if (this.encapsulatedProcess !== runningProcess) return
+          if (this.desiredStatus === 'stopped' || this.currentStatus !== 'running') return
+          this.appLogger.error(
+            `backend ${this.name} exited unexpectedly (code=${code}, signal=${signal})`,
+            this.name,
+          )
+          this.encapsulatedProcess = null
+          this.desiredStatus = 'failed'
+          this.setStatus('failed')
+        })
       } else {
         this.currentStatus = 'failed'
         this.desiredStatus = 'failed'
@@ -675,29 +719,12 @@ export abstract class LongLivedPythonApiService implements ApiService {
       return 'stopped'
     }
 
-    // Try graceful shutdown first with SIGTERM
-    proc.kill('SIGTERM')
-
-    // Wait up to 2 seconds for the process to exit gracefully
-    const gracefulExit = await Promise.race([
-      new Promise<boolean>((resolve) => {
-        proc.once('exit', () => resolve(true))
-      }),
-      new Promise<boolean>((resolve) => {
-        setTimeout(() => resolve(false), 2000)
-      }),
-    ])
-
-    if (!gracefulExit) {
-      // Force kill if graceful shutdown failed
-      this.appLogger.warn(
-        `Backend ${this.name} did not exit gracefully within 2s, sending SIGKILL`,
-        this.name,
-      )
-      proc.kill('SIGKILL')
-      // Give a short time for the forced kill to take effect
-      await new Promise((resolve) => setTimeout(resolve, 500))
-    }
+    // Reliably tear down the whole process tree. On Windows this is critical:
+    // ChildProcess.kill() only signals the direct child, leaving descendants
+    // (ComfyUI's python, the uv subprocesses spawned by ComfyUI-Manager, …)
+    // running. Orphans keep the port + GPU memory (→ OOM on the next launch)
+    // and handles on the service directory (→ EPERM on reinstall).
+    await terminateProcessTree(proc, { name: this.name, appLogger: this.appLogger })
 
     this.encapsulatedProcess = null
     this.setStatus('stopped')

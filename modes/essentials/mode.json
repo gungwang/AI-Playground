@@ -7,16 +7,16 @@
   "displayOrder": 10,
   "requiresNvidiaGpu": false,
   "includePresets": [
-    "basic-chat",
+    "assistant",
     "inpaint",
     "manual",
     "outpaint",
-    "rag-chat",
     "sd15",
     "sdxl",
     "SketchToPhoto-HD",
     "upscale"
   ],
+  "excludeVariantBackends": ["openvino"],
   "ui": {
     "i18n": {
       "titleOne": "PRODUCT_MODE_ESSENTIALS_TITLE_ONE",

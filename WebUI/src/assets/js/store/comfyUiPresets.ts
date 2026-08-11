@@ -1,7 +1,8 @@
 import { defineStore, acceptHMRUpdate } from 'pinia'
 import { WebSocket } from 'partysocket'
 import { demoAwareStorage } from '../demoAwareStorage'
-import { ComfyUIApiWorkflow } from './presets'
+import { ComfyUIApiWorkflow, type Preset } from './presets'
+import { useDeveloperSettings } from './developerSettings'
 import {
   useImageGenerationPresets,
   modelNameForComfyApi,
@@ -9,242 +10,55 @@ import {
   type MediaItem,
 } from './imageGenerationPresets'
 import { useI18N } from './i18n'
-import * as toast from '../toast'
+import { useErrors } from './errors'
+import { useActivities } from './activities'
+import { createAppError } from '../errors/appError'
 import { useBackendServices } from '@/assets/js/store/backendServices.ts'
 import { usePromptStore } from './promptArea'
-import { z } from 'zod'
-import { imageUrlToDataUri, isImageUrl } from '@/lib/utils'
-
-const WEBSOCKET_OPEN = 1
-
-const settingToComfyInputsName = {
-  seed: ['seed', 'noise_seed'],
-  inferenceSteps: ['steps'],
-  height: ['height'],
-  width: ['width'],
-  prompt: ['text'],
-  negativePrompt: ['text'],
-  batchSize: ['batch_size'],
-} satisfies Partial<Record<string, string[]>>
-
-type ComfySetting = keyof typeof settingToComfyInputsName
-
-const ComfyMessageSchema = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('status'),
-  }),
-  z.object({
-    type: z.literal('execution_start'),
-    data: z.object({}).passthrough(),
-  }),
-  z.object({
-    type: z.literal('execution_success'),
-    data: z.object({}).passthrough(),
-  }),
-  z.object({
-    type: z.literal('execution_error'),
-    data: z.object({ exception_message: z.string().optional() }).passthrough(),
-  }),
-  z.object({
-    type: z.literal('execution_interrupted'),
-    data: z.object({}).passthrough(),
-  }),
-  z.object({
-    type: z.literal('execution_cached'),
-    data: z.object({}).passthrough(),
-  }),
-  z.object({
-    type: z.literal('progress'),
-    data: z
-      .object({
-        value: z.number(),
-        max: z.number(),
-      })
-      .passthrough(),
-  }),
-  z.object({
-    type: z.literal('executing'),
-    data: z
-      .object({
-        node: z.string().nullable().optional(),
-        display_node: z.string().optional(),
-      })
-      .passthrough(),
-  }),
-  z.object({
-    type: z.literal('executed'),
-    data: z
-      .object({
-        output: z.union([
-          z.object({
-            images: z.array(
-              z.object({
-                filename: z.string(),
-                subfolder: z.string(),
-                type: z.string(),
-              }),
-            ),
-            animated: z.array(z.boolean()).optional(),
-          }),
-          z.object({
-            gifs: z.array(
-              z.object({
-                filename: z.string(),
-                workflow: z.string(),
-                type: z.string(),
-                subfolder: z.string(),
-                format: z.string(),
-              }),
-            ),
-          }),
-          z.object({
-            '3d': z.array(
-              z.object({
-                filename: z.string(),
-                subfolder: z.string(),
-                type: z.string(),
-              }),
-            ),
-          }),
-        ]),
-      })
-      .passthrough(),
-  }),
-  z.object({
-    type: z.literal('progress_state'),
-    data: z.object({}).passthrough(),
-  }),
-])
-
-const findKeysByTitle = (workflow: ComfyUIApiWorkflow, title: ComfySetting | 'loader' | string) =>
-  Object.entries(workflow)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    .filter(([_key, value]) => (value as any)?.['_meta']?.title === title)
-    .map(([key, _value]) => key)
-
-const findKeysByClassType = (workflow: ComfyUIApiWorkflow, classType: string) =>
-  Object.entries(workflow)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    .filter(([_key, value]) => (value as any)?.['class_type'] === classType)
-    .map(([key, _value]) => key)
-
-const findKeysByInputsName = (workflow: ComfyUIApiWorkflow, setting: ComfySetting) => {
-  for (const inputName of settingToComfyInputsName[setting]) {
-    if (inputName === 'text') continue
-    const keys = Object.entries(workflow)
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      .filter(([_key, value]) => (value as any)?.['inputs']?.[inputName ?? ''] !== undefined)
-      .map(([key, _value]) => key)
-    if (keys.length > 0) return keys
-  }
-  return []
-}
-
-const getInputNameBySettingAndKey = (
-  workflow: ComfyUIApiWorkflow,
-  key: string,
-  setting: ComfySetting,
-) => {
-  for (const inputName of settingToComfyInputsName[setting]) {
-    if (workflow[key]?.inputs?.[inputName ?? '']) return inputName
-  }
-  return ''
-}
-
-function modifySettingInWorkflow(
-  workflow: ComfyUIApiWorkflow,
-  setting: ComfySetting,
-  value: unknown,
-) {
-  const keys =
-    findKeysByTitle(workflow, setting).length > 0
-      ? findKeysByTitle(workflow, setting)
-      : findKeysByInputsName(workflow, setting)
-  if (keys.length === 0) {
-    console.warn(`No key found for setting ${setting}. Skipping this setting.`)
-    return
-  }
-  if (keys.length > 1) {
-    console.warn(`Multiple keys found for setting ${setting}. Using first one`)
-  }
-  const key = keys[0]
-  const inputName = getInputNameBySettingAndKey(workflow, key, setting)
-  if (workflow[key]?.inputs?.[inputName] !== undefined) {
-    workflow[key].inputs[inputName] = value
-  } else if (workflow[key]?.inputs?.['a'] !== undefined) {
-    workflow[key].inputs['a'] = value
-  }
-}
-
-/** ComfyUI node input names that hold model/file paths; separator is OS-dependent (see main.ts preset handling). */
-const COMFY_MODEL_PATH_INPUTS = new Set([
-  'ckpt_name',
-  'lora_name',
-  'vae_name',
-  'unet_name',
-  'clip_name',
-  'model_name',
-  'control_net_name',
-])
-
-function normalizeModelPathsInWorkflow(
-  workflow: ComfyUIApiWorkflow,
-  platform: NodeJS.Platform,
-): void {
-  for (const node of Object.values(workflow)) {
-    const inputs = (node as { inputs?: Record<string, unknown> }).inputs
-    if (!inputs) continue
-    for (const [inputName, value] of Object.entries(inputs)) {
-      if (COMFY_MODEL_PATH_INPUTS.has(inputName) && typeof value === 'string') {
-        inputs[inputName] = modelNameForComfyApi(value, platform)
-      }
-    }
-  }
-}
+import { imageUrlToDataUri, isImageUrl, mediaUrl } from '@/lib/utils'
+import { getComfyAuthToken, invalidateComfyAuthToken } from '@/lib/loopbackAuth'
+import {
+  findKeysByClassType,
+  findKeysByTitle,
+  modifySettingInWorkflow,
+} from './comfyUiWorkflowHelpers'
+import {
+  ComfyMessageSchema,
+  summarizeComfyExecutionError,
+  type ComfyExecutionErrorData,
+} from './comfyUiMessages'
+import {
+  bypassNode,
+  injectOvmsImageUrl,
+  normalizeModelPathsInWorkflow,
+  workflowUsesOvmsImage,
+} from './comfyUiWorkflowTransforms'
 
 /**
- * Bypass a node by rewiring its outputs to its upstream and removing the node.
- * Supported: LoraLoader (output 0 = model from input "model", output 1 = clip from input "clip").
+ * Wraps fetch() with the ComfyUI loopback bearer token. The bundled
+ * `aipg-auth` ComfyUI custom_node requires this header on every non-/queue
+ * request; without it any other local process / web page could reach
+ * ComfyUI's API on 127.0.0.1.
  */
-function bypassNode(workflow: ComfyUIApiWorkflow, nodeId: string): void {
-  const node = workflow[nodeId] as
-    | { class_type?: string; inputs?: Record<string, unknown> }
-    | undefined
-  if (!node?.inputs) return
-  const classType = node.class_type
-  let rewire: [number, [string, number]][]
-  if (classType === 'LoraLoader') {
-    const model = node.inputs.model as [string, number] | undefined
-    const clip = node.inputs.clip as [string, number] | undefined
-    if (!model || !clip) return
-    rewire = [
-      [0, model],
-      [1, clip],
-    ]
-  } else {
-    return
+async function comfyFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  let token = await getComfyAuthToken()
+  const buildInit = (t: string): RequestInit => {
+    const headers = new Headers(init?.headers ?? {})
+    if (t) headers.set('Authorization', `Bearer ${t}`)
+    return { ...(init ?? {}), headers }
   }
-  for (const entry of Object.values(workflow)) {
-    const inputs = (entry as { inputs?: Record<string, unknown> }).inputs
-    if (!inputs) continue
-    for (const key of Object.keys(inputs)) {
-      const v = inputs[key]
-      if (
-        Array.isArray(v) &&
-        v.length === 2 &&
-        typeof v[0] === 'string' &&
-        typeof v[1] === 'number'
-      ) {
-        if (v[0] === nodeId) {
-          const slot = v[1]
-          const upstream = rewire.find(([s]) => s === slot)?.[1]
-          if (upstream) inputs[key] = upstream
-        }
-      }
+  let response = await fetch(input, buildInit(token))
+  if (response.status === 401) {
+    invalidateComfyAuthToken()
+    token = await getComfyAuthToken()
+    if (token) {
+      response = await fetch(input, buildInit(token))
     }
   }
-  delete workflow[nodeId]
+  return response
 }
+
+const WEBSOCKET_OPEN = 1
 
 /** Rewire and remove optional model nodes whose value is None (e.g. LoRA bypass). */
 function bypassOptionalModelNodes(workflow: ComfyUIApiWorkflow): void {
@@ -278,8 +92,107 @@ export const useComfyUiPresets = defineStore(
   'comfyUiPresets',
   () => {
     const imageGeneration = useImageGenerationPresets()
+    const errors = useErrors()
+    const activities = useActivities()
     const i18nState = useI18N().state
     const comfyPort = computed(() => comfyUiState.value?.port)
+
+    // Bridge the generation FSM (imageGeneration.currentState) to a single activity
+    // so the central activity sink reflects image-gen progress. For desktop runs the
+    // activity is imageGen-scoped; for tool calls it nests under the chat tool
+    // activity (generationParentActivityId) so the chat status line shows progress.
+    let generationActivityId: string | null = null
+    const GENERATION_ACTIVE_STATES = [
+      'start_backend',
+      'install_workflow_components',
+      'load_workflow_components',
+      'load_model',
+      'load_model_components',
+      'generating',
+    ]
+    function generationStateLabel(state: string): string {
+      switch (state) {
+        case 'start_backend':
+          return i18nState.COM_STARTING_BACKEND
+        case 'load_model':
+          return i18nState.COM_LOADING_MODEL
+        case 'load_model_components':
+          return i18nState.COM_LOADING_MODEL_COMPONENTS
+        case 'install_workflow_components':
+          return i18nState.COM_INSTALL_WORKFLOW_COMPONENTS
+        case 'load_workflow_components':
+          return i18nState.COM_LOADING_WORKFLOW_COMPONENTS
+        case 'generating':
+          return imageGeneration.stepText || i18nState.COM_GENERATING
+        default:
+          return i18nState.COM_GENERATING
+      }
+    }
+    watch(
+      () =>
+        [
+          imageGeneration.currentState,
+          imageGeneration.stepText,
+          imageGeneration.processing,
+        ] as const,
+      ([state, _stepText, processing]) => {
+        const isActive = processing || GENERATION_ACTIVE_STATES.includes(state)
+        if (isActive) {
+          const label = generationStateLabel(state)
+          if (!generationActivityId) {
+            generationActivityId = activities.begin({
+              category: 'generation',
+              label,
+              scope: { kind: 'imageGen' },
+              parentId: imageGeneration.generationParentActivityId ?? undefined,
+            })
+          } else {
+            activities.update(generationActivityId, { label })
+          }
+        } else if (generationActivityId) {
+          const endState =
+            state === 'error' ? 'failed' : state === 'image_out' ? 'done' : 'cancelled'
+          activities.end(generationActivityId, endState)
+          generationActivityId = null
+        }
+      },
+    )
+
+    // Watchdog: if a generation neither completes nor errors within this window,
+    // we assume the backend is wedged and fail the in-flight items so the UI and
+    // any LLM tool call waiting on completion are released instead of hanging.
+    const GENERATION_WATCHDOG_MS = 10 * 60 * 1000
+    let watchdogTimer: ReturnType<typeof setTimeout> | null = null
+    // Set while we intentionally restart ComfyUI mid-generate (to install custom
+    // nodes), so crash detection doesn't mistake the planned bounce for a crash.
+    let backendRestarting = false
+
+    function clearWatchdog() {
+      if (watchdogTimer !== null) {
+        clearTimeout(watchdogTimer)
+        watchdogTimer = null
+      }
+    }
+
+    function armWatchdog() {
+      clearWatchdog()
+      watchdogTimer = setTimeout(() => {
+        watchdogTimer = null
+        if (!imageGeneration.processing) return
+        const promptStore = usePromptStore()
+        promptStore.promptSubmitted = false
+        imageGeneration.failGeneration('Image generation timed out.')
+        errors.report(
+          createAppError({
+            category: 'generation',
+            code: 'generation/timeout',
+            userMessage:
+              'Image generation timed out. The ComfyUI backend may be stuck — try again or restart it.',
+            surface: 'toast',
+          }),
+        )
+      }, GENERATION_WATCHDOG_MS)
+    }
     const comfyBaseUrl = computed(() => comfyUiState.value?.baseUrl)
 
     const websocket = ref<WebSocket | null>(null)
@@ -304,14 +217,20 @@ export const useComfyUiPresets = defineStore(
       const requirements = await checkPresetRequirements()
       if (!requirements.hasMissingRequirements) return
       console.info('restarting comfyUI to finalize installation of required custom nodes')
-      await backendServices.stopService('comfyui-backend')
-      await triggerInstallPythonPackagesForActivePreset() // Backend already stopped above
-      await installCustomNodesForActivePreset()
-      const startingResult = await backendServices.startService('comfyui-backend')
-      if (startingResult !== 'running') {
-        throw new Error('Failed to restart comfyUI. Required Nodes are not active.')
+      // Suspend crash detection: this stop/start is intentional, not a crash.
+      backendRestarting = true
+      try {
+        await backendServices.stopService('comfyui-backend')
+        await triggerInstallPythonPackagesForActivePreset() // Backend already stopped above
+        await installCustomNodesForActivePreset()
+        const startingResult = await backendServices.startService('comfyui-backend')
+        if (startingResult !== 'running') {
+          throw new Error('Failed to restart comfyUI. Required Nodes are not active.')
+        }
+        console.info('restart complete')
+      } finally {
+        backendRestarting = false
       }
-      console.info('restart complete')
     }
 
     async function checkPresetRequirements(): Promise<{
@@ -564,13 +483,26 @@ export const useComfyUiPresets = defineStore(
       }
     }
 
-    function connectToComfyUi() {
+    async function connectToComfyUi() {
       if (comfyUiState.value?.status !== 'running') {
         console.warn('ComfyUI backend not running, cannot start websocket')
         return
       }
 
-      const comfyWsUrl = `ws://localhost:${comfyPort.value}/ws?clientId=${clientId}`
+      // Browsers cannot set custom headers on WebSocket upgrades, so the
+      // bundled aipg-auth middleware accepts the loopback token via query
+      // string for the /ws endpoint.
+      //
+      // Force-refresh the token: a rejected WS upgrade just shows up as a
+      // close event with no auth-specific status code, so we can't detect
+      // and retry like we do for HTTP 401. Pulling fresh from the Electron
+      // main process on every connect attempt is cheap (single IPC) and
+      // ensures we never connect with a token from a previous ComfyUI spawn
+      // (each spawn regenerates AIPG_LOOPBACK_TOKEN).
+      const wsToken = await getComfyAuthToken(true)
+      const comfyWsUrl =
+        `ws://localhost:${comfyPort.value}/ws?clientId=${clientId}` +
+        (wsToken ? `&token=${encodeURIComponent(wsToken)}` : '')
 
       if (websocket.value) {
         const state = websocket.value.readyState
@@ -600,6 +532,13 @@ export const useComfyUiPresets = defineStore(
           code: event.code,
           reason: event.reason,
         })
+        // Drop the cached token in case the close was caused by an auth
+        // rejection on the upgrade (e.g. ComfyUI restarted with a fresh
+        // AIPG_LOOPBACK_TOKEN). The next connect attempt will pull a fresh
+        // token from the Electron main process. This is also a no-op on a
+        // clean close, since the next force-refresh in connectToComfyUi
+        // will overwrite it anyway.
+        invalidateComfyAuthToken()
       })
 
       websocket.value.addEventListener('error', (error) => {
@@ -662,6 +601,12 @@ export const useComfyUiPresets = defineStore(
               case 'progress':
                 imageGeneration.currentState = 'generating'
                 imageGeneration.stepText = `${i18nState.COM_GENERATING} ${msg.data.value}/${msg.data.max}`
+                if (generationActivityId && msg.data.max > 0) {
+                  activities.update(generationActivityId, {
+                    label: imageGeneration.stepText,
+                    progress: msg.data.value / msg.data.max,
+                  })
+                }
                 console.log('progress', { data: msg.data })
                 break
               case 'executing':
@@ -693,7 +638,9 @@ export const useComfyUiPresets = defineStore(
                   if (image) {
                     let newItem: MediaItem
                     if (output?.animated?.[imageIndex]) {
-                      const videoUrl = `aipg-media://${image.subfolder ? `${image.subfolder}/${image.filename}` : image.filename}`
+                      const videoUrl = mediaUrl(
+                        image.subfolder ? `${image.subfolder}/${image.filename}` : image.filename,
+                      )
                       newItem = {
                         ...queuedImages[generateIdx],
                         state: 'done',
@@ -706,7 +653,9 @@ export const useComfyUiPresets = defineStore(
                         ...queuedImages[generateIdx],
                         state: 'done',
                         type: 'image',
-                        imageUrl: `aipg-media://${image.subfolder ? `${image.subfolder}/${image.filename}` : image.filename}`,
+                        imageUrl: mediaUrl(
+                          image.subfolder ? `${image.subfolder}/${image.filename}` : image.filename,
+                        ),
                         createdAt,
                       }
                     }
@@ -721,8 +670,12 @@ export const useComfyUiPresets = defineStore(
                 if ('gifs' in output) {
                   const video = output.gifs.find((i) => i.type === 'output')
                   if (video) {
-                    const videoUrl = `aipg-media://${video.subfolder ? `${video.subfolder}/${video.filename}` : video.filename}`
-                    const thumbnailUrl = `aipg-media://${video.subfolder ? `${video.subfolder}/${video.workflow}` : video.workflow}`
+                    const videoUrl = mediaUrl(
+                      video.subfolder ? `${video.subfolder}/${video.filename}` : video.filename,
+                    )
+                    const thumbnailUrl = mediaUrl(
+                      video.subfolder ? `${video.subfolder}/${video.workflow}` : video.workflow,
+                    )
                     const newImage: MediaItem = {
                       ...queuedImages[generateIdx],
                       state: 'done',
@@ -742,7 +695,11 @@ export const useComfyUiPresets = defineStore(
                 if ('3d' in output) {
                   const model3d = output['3d'].find((i) => i.type === 'output')
                   if (model3d) {
-                    const model3dUrl = `aipg-media://${model3d.subfolder ? `${model3d.subfolder}/${model3d.filename}` : model3d.filename}`
+                    const model3dUrl = mediaUrl(
+                      model3d.subfolder
+                        ? `${model3d.subfolder}/${model3d.filename}`
+                        : model3d.filename,
+                    )
                     const newImage: MediaItem = {
                       ...queuedImages[generateIdx],
                       state: 'done',
@@ -760,23 +717,61 @@ export const useComfyUiPresets = defineStore(
                 }
                 console.log('executed', { detail: msg.data })
                 break
-              case 'execution_start':
+              case 'execution_start': {
+                // Ignore stray starts for batch entries we already failed/cancelled,
+                // so the UI doesn't bounce back into 'processing' with nothing in flight.
+                const hasInFlight = imageGeneration.generatedImages.some(
+                  (item) => item.state === 'queued' || item.state === 'generating',
+                )
+                if (!hasInFlight) {
+                  console.log('execution_start ignored (no in-flight items)', { detail: msg.data })
+                  break
+                }
                 imageGeneration.processing = true
                 imageGeneration.currentState = 'load_workflow_components'
+                armWatchdog()
                 console.log('execution_start', { detail: msg.data })
                 break
+              }
               case 'execution_success':
                 imageGeneration.processing = false
+                clearWatchdog()
                 console.log('execution_success', { detail: msg.data })
                 break
-              case 'execution_error':
-                imageGeneration.processing = false
-                imageGeneration.currentState = 'error'
+              case 'execution_error': {
+                clearWatchdog()
                 const promptStore = usePromptStore()
                 promptStore.promptSubmitted = false
-                if (msg.data.exception_message) toast.error(msg.data.exception_message)
+                const data = msg.data as ComfyExecutionErrorData
+                // Short, actionable message for the failed panel + toast; the raw
+                // exception/traceback is kept only in technicalMessage (console + debug).
+                const userMessage = summarizeComfyExecutionError(data)
+                const technicalMessage =
+                  [
+                    data.exception_type,
+                    data.node_type ? `node: ${data.node_type} (${data.node_id ?? '?'})` : null,
+                    data.exception_message,
+                    Array.isArray(data.traceback) ? data.traceback.join('') : null,
+                  ]
+                    .filter(Boolean)
+                    .join('\n') || JSON.stringify(msg.data)
+                // Move in-flight items to a terminal 'failed' state (no more stuck
+                // spinners) and surface a single toast via the sink.
+                imageGeneration.failGeneration(userMessage)
+                errors.report(
+                  createAppError({
+                    category: 'generation',
+                    code: 'generation/execution-error',
+                    userMessage,
+                    technicalMessage,
+                    surface: 'toast',
+                    context: { serviceName: 'comfyui-backend' },
+                  }),
+                )
                 break
+              }
               case 'execution_interrupted':
+                clearWatchdog()
                 imageGeneration.processing = false
                 imageGeneration.currentState = 'no_start'
                 break
@@ -816,7 +811,7 @@ export const useComfyUiPresets = defineStore(
                 return
               }
               pendingGenerationRequest.value = null
-              generate(pending.imageIds, pending.mode, pending.sourceImage)
+              generate(pending.imageIds, pending.mode, pending.sourceImage, true)
             }, 500)
           }
           attemptRetry()
@@ -838,6 +833,34 @@ export const useComfyUiPresets = defineStore(
       }
     })
 
+    // Crash detection: if the backend leaves 'running' while a generation is in
+    // flight (and we didn't intentionally restart it for a node install), the
+    // process has died/stopped underneath us. Fail the in-flight items instead of
+    // letting the UI sit on a stale 'running' world with a frozen spinner.
+    watch(
+      () => comfyUiState.value?.status,
+      (status, previousStatus) => {
+        if (previousStatus === 'running' && status !== 'running') {
+          if (backendRestarting) return
+          if (!imageGeneration.processing && imageGeneration.currentState === 'no_start') return
+          clearWatchdog()
+          const promptStore = usePromptStore()
+          promptStore.promptSubmitted = false
+          imageGeneration.failGeneration('The ComfyUI backend stopped unexpectedly.')
+          errors.report(
+            createAppError({
+              category: 'generation',
+              code: 'generation/backend-stopped',
+              userMessage:
+                'The ComfyUI backend stopped unexpectedly during generation. Please restart it and try again.',
+              surface: 'toast',
+              context: { serviceName: 'comfyui-backend' },
+            }),
+          )
+        }
+      },
+    )
+
     function dataURItoBlob(dataURI: string) {
       const bytes =
         dataURI.split(',')[0].indexOf('base64') >= 0
@@ -853,6 +876,31 @@ export const useComfyUiPresets = defineStore(
       return new Blob([intArray], { type: mimeType })
     }
 
+    // ComfyUI v0.25.1's LoadImage decodes every image through PyAV. Frames that
+    // decode to a non-rgb24/rgba pixel format (16-bit or grayscale PNGs, incl.
+    // the 1-bit grayscale placeholder used for empty optional inputs) take a
+    // pad/fillborders alignment filter graph when their width isn't a multiple
+    // of 32, which fails format negotiation on the bundled ffmpeg
+    // (av.error.ArgumentError: Invalid argument returned 22). Re-encoding the
+    // image through a 2D canvas forces 8-bit RGBA, so it decodes to rgb24/rgba
+    // and skips that branch entirely.
+    async function reencodeImageTo8BitPng(dataUri: string): Promise<string> {
+      const img = new Image()
+      img.src = dataUri
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve()
+        img.onerror = () => reject(new Error('Failed to load image for re-encoding'))
+      })
+      if (img.naturalWidth === 0 || img.naturalHeight === 0) return dataUri
+      const canvas = document.createElement('canvas')
+      canvas.width = img.naturalWidth
+      canvas.height = img.naturalHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return dataUri
+      ctx.drawImage(img, 0, 0)
+      return canvas.toDataURL('image/png')
+    }
+
     function validateRequiredImageInputs(): string[] {
       const missingInputs: string[] = []
 
@@ -863,7 +911,8 @@ export const useComfyUiPresets = defineStore(
         }
 
         // Check if this is a required image input
-        const isImageType = input.type === 'image' || input.type === 'inpaintMask'
+        const isImageType =
+          input.type === 'image' || input.type === 'inpaintMask' || input.type === 'outpaintCanvas'
         const isDisplayed = input.displayed !== false // defaults to true
         const isModifiable = input.modifiable !== false // defaults to true
         const hasNoDefault = input.defaultValue === '' || input.defaultValue === undefined
@@ -917,7 +966,11 @@ export const useComfyUiPresets = defineStore(
             ;(mutableWorkflow[keys[0]].inputs as any)[input.nodeInput] = value
           }
         }
-        if (input.type === 'image' || input.type === 'inpaintMask') {
+        if (
+          input.type === 'image' ||
+          input.type === 'inpaintMask' ||
+          input.type === 'outpaintCanvas'
+        ) {
           const rawValue = input.current.value
           const isEmpty = typeof rawValue !== 'string' || rawValue === '' || !isImageUrl(rawValue)
           const isOptional = input.optional === true
@@ -934,6 +987,11 @@ export const useComfyUiPresets = defineStore(
             continue
           }
 
+          // Normalize to 8-bit RGBA PNG so ComfyUI's PyAV-based LoadImage never
+          // hits the alignment filter graph that crashes on planar-float /
+          // grayscale frames (see reencodeImageTo8BitPng).
+          imageDataUri = await reencodeImageTo8BitPng(imageDataUri)
+
           const uploadImageHash = Array.from(
             new Uint8Array(
               await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(imageDataUri)),
@@ -941,21 +999,15 @@ export const useComfyUiPresets = defineStore(
           )
             .map((b) => b.toString(16).padStart(2, '0'))
             .join('')
-          // For inpaintMask, always use PNG to preserve alpha channel
-          // For regular images, extract extension from data URI
-          let uploadImageExtension = 'png'
-          if (input.type === 'image') {
-            const match = imageDataUri.match(/data:image\/(png|jpeg|webp);base64,/)
-            uploadImageExtension = match?.[1] || 'png'
-          }
-          const uploadImageName = `${uploadImageHash}.${uploadImageExtension}`
+          // Always PNG now that the data URI is canvas-re-encoded above.
+          const uploadImageName = `${uploadImageHash}.png`
           if (mutableWorkflow[keys[0]].inputs !== undefined) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             ;(mutableWorkflow[keys[0]].inputs as any)[input.nodeInput] = uploadImageName
           }
           const data = new FormData()
           data.append('image', dataURItoBlob(imageDataUri), uploadImageName)
-          await fetch(`${comfyBaseUrl.value}/upload/image`, {
+          await comfyFetch(`${comfyBaseUrl.value}/upload/image`, {
             method: 'POST',
             body: data,
           })
@@ -982,7 +1034,7 @@ export const useComfyUiPresets = defineStore(
           }
           const data = new FormData()
           data.append('image', dataURItoBlob(input.current.value), uploadVideoName)
-          await fetch(`${comfyBaseUrl.value}/upload/image`, {
+          await comfyFetch(`${comfyBaseUrl.value}/upload/image`, {
             method: 'POST',
             body: data,
           })
@@ -998,22 +1050,109 @@ export const useComfyUiPresets = defineStore(
       promptStore.promptSubmitted = false
     }
 
-    async function generate(imageIds: string[], mode: WorkflowModeType, sourceImage?: string) {
+    /**
+     * If the preset's workflow uses OVMS image nodes, ensure the OVMS image server
+     * is running with the correct model. Returns the server URL on success, null if
+     * the workflow doesn't need OVMS, or false on failure (caller should abort).
+     */
+    async function ensureOvmsImageServerIfNeeded(preset: Preset): Promise<string | null | false> {
+      if (preset.type !== 'comfy') return null
+      if (!workflowUsesOvmsImage(preset.comfyUiApiWorkflow)) return null
+
+      const modelInput = imageGeneration.comfyInputs.find(
+        (input) => 'nodeInput' in input && input.nodeInput === 'model',
+      )
+      const modelId =
+        (modelInput && 'current' in modelInput ? String(modelInput.current.value) : '') ||
+        preset.requiredModels?.[0]?.model ||
+        ''
+
+      if (!modelId) {
+        errors.report(
+          createAppError({
+            category: 'generation',
+            code: 'generation/ovms-no-model',
+            userMessage: 'No model id configured for OVMS image generation.',
+            surface: 'toast',
+          }),
+        )
+        return false
+      }
+
+      try {
+        const { keepModelsLoaded } = useDeveloperSettings()
+        // Pass the current generation resolution so OVMS can statically reshape the image
+        // pipeline when running on NPU (required by the NPU plugin). Ignored on other devices.
+        const resolution = `${imageGeneration.width}x${imageGeneration.height}`
+        const result = await window.electronAPI.ensureOvmsImageReady(
+          'openvino-backend',
+          modelId,
+          keepModelsLoaded,
+          resolution,
+        )
+        if (result.success && result.url) {
+          return result.url
+        }
+        errors.report(
+          createAppError({
+            category: 'generation',
+            code: 'generation/ovms-start-failed',
+            userMessage: `Failed to start OVMS image server: ${result.error || 'unknown error'}`,
+            surface: 'toast',
+            context: { serviceName: 'openvino-backend' },
+          }),
+        )
+        return false
+      } catch (error) {
+        errors.report(error, {
+          category: 'generation',
+          code: 'generation/ovms-error',
+          userMessage: 'OVMS image server error.',
+          surface: 'toast',
+          context: { serviceName: 'openvino-backend' },
+        })
+        return false
+      }
+    }
+
+    async function generate(
+      imageIds: string[],
+      mode: WorkflowModeType,
+      sourceImage?: string,
+      isRetry = false,
+    ) {
       const preset = imageGeneration.activePreset
       if (!preset || preset.type !== 'comfy') {
         console.warn('The selected preset is not a comfyui preset')
         return
       }
-      if (imageGeneration.processing) {
+      // `isRetry` is the auto-retry that fires once the backend finishes starting.
+      // It is a continuation of the same operation, so it must bypass the
+      // re-entrancy guard (which still keeps `processing` true to drive the UI).
+      if (imageGeneration.processing && !isRetry) {
         console.warn('Already processing')
         return
       }
 
+      // Surface progress immediately so the chat tool widget and the desktop
+      // overlay show a "starting" state instead of nothing while the backend
+      // boots / the request is queued.
+      imageGeneration.processing = true
+      imageGeneration.currentState = 'start_backend'
+
       try {
         const result = await window.electronAPI.ensureComfyUIBackendRunning()
         if (!result.success) {
-          console.error('Failed to ensure ComfyUI backend is running:', result.error)
-          toast.error('Failed to start ComfyUI backend')
+          errors.report(
+            createAppError({
+              category: 'generation',
+              code: 'generation/backend-start-failed',
+              userMessage: 'Failed to start the ComfyUI backend.',
+              technicalMessage: result.error ?? 'ensureComfyUIBackendRunning returned failure',
+              surface: 'toast',
+              context: { serviceName: 'comfyui-backend' },
+            }),
+          )
           resetGenerationState()
           return
         }
@@ -1021,12 +1160,18 @@ export const useComfyUiPresets = defineStore(
         if (result.starting) {
           console.info('ComfyUI backend is starting, queueing generation request')
           pendingGenerationRequest.value = { imageIds, mode, sourceImage }
-          resetGenerationState()
+          // Keep the 'start_backend' indicator up; the auto-retry will continue
+          // this operation once the backend reaches 'running'.
           return
         }
       } catch (error) {
-        console.error('Error checking backend:', error)
-        toast.error('Failed to check backend compatibility')
+        errors.report(error, {
+          category: 'generation',
+          code: 'generation/backend-check-failed',
+          userMessage: 'Failed to check the ComfyUI backend.',
+          surface: 'toast',
+          context: { serviceName: 'comfyui-backend' },
+        })
         resetGenerationState()
         return
       }
@@ -1034,12 +1179,13 @@ export const useComfyUiPresets = defineStore(
       if (comfyUiState.value?.status !== 'running') {
         console.warn('ComfyUI backend is not running. Current status:', comfyUiState.value?.status)
         pendingGenerationRequest.value = { imageIds, mode, sourceImage }
-        resetGenerationState()
+        // Keep the 'start_backend' indicator up; the auto-retry continues once running.
         return
       }
 
       if (websocket.value?.readyState !== WEBSOCKET_OPEN) {
         console.warn('Websocket not open')
+        resetGenerationState()
         return
       }
 
@@ -1047,7 +1193,14 @@ export const useComfyUiPresets = defineStore(
       const missingInputs = validateRequiredImageInputs()
       if (missingInputs.length > 0) {
         const inputLabels = missingInputs.join(', ')
-        toast.error(`Missing required image inputs: ${inputLabels}`)
+        errors.report(
+          createAppError({
+            category: 'validation',
+            code: 'generation/missing-image-inputs',
+            userMessage: `Missing required image inputs: ${inputLabels}`,
+            surface: 'toast',
+          }),
+        )
         resetGenerationState()
         return
       }
@@ -1056,6 +1209,13 @@ export const useComfyUiPresets = defineStore(
         imageGeneration.processing = true
         imageGeneration.currentState = 'install_workflow_components'
         await installCustomNodesForActivePresetFully()
+
+        // Ensure OVMS image server is ready if the workflow uses OpenAI-compatible image nodes
+        const ovmsImageUrl = await ensureOvmsImageServerIfNeeded(preset)
+        if (ovmsImageUrl === false) {
+          resetGenerationState()
+          return
+        }
 
         const platform = await window.electronAPI.getPlatform()
         const mutableWorkflow: ComfyUIApiWorkflow = JSON.parse(
@@ -1072,6 +1232,11 @@ export const useComfyUiPresets = defineStore(
         modifySettingInWorkflow(mutableWorkflow, 'negativePrompt', imageGeneration.negativePrompt)
 
         await modifyDynamicSettingsInWorkflow(mutableWorkflow, platform)
+
+        if (ovmsImageUrl) {
+          injectOvmsImageUrl(mutableWorkflow, ovmsImageUrl)
+        }
+
         bypassOptionalModelNodes(mutableWorkflow)
         normalizeModelPathsInWorkflow(mutableWorkflow, platform)
 
@@ -1102,7 +1267,7 @@ export const useComfyUiPresets = defineStore(
         })
         for (const image of queuedImages) {
           modifySettingInWorkflow(mutableWorkflow, 'seed', `${image.settings.seed!.toFixed(0)}`)
-          const result = await fetch(`${comfyBaseUrl.value}/prompt`, {
+          const result = await comfyFetch(`${comfyBaseUrl.value}/prompt`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -1124,14 +1289,22 @@ export const useComfyUiPresets = defineStore(
         })
         imageGeneration.currentState = 'load_workflow_components'
       } catch (ex) {
-        console.error('Error generating image', ex)
-        toast.error('Backend could not generate image.')
-        resetGenerationState()
+        clearWatchdog()
+        imageGeneration.failGeneration('The ComfyUI backend could not generate the image.')
+        errors.report(ex, {
+          category: 'generation',
+          code: 'generation/request-failed',
+          userMessage: 'The ComfyUI backend could not generate the image.',
+          surface: 'toast',
+          context: { serviceName: 'comfyui-backend' },
+        })
+        const promptStore = usePromptStore()
+        promptStore.promptSubmitted = false
       }
     }
 
     async function freeMemoryAndUnloadModels() {
-      await fetch(`${comfyBaseUrl.value}/free`, {
+      await comfyFetch(`${comfyBaseUrl.value}/free`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1141,22 +1314,37 @@ export const useComfyUiPresets = defineStore(
     }
 
     async function stop() {
-      await fetch(`${comfyBaseUrl.value}/queue`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ clear: true }),
-      })
-      await fetch(`${comfyBaseUrl.value}/interrupt`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
-      // Immediately reset processing state to unblock UI
-      imageGeneration.processing = false
-      imageGeneration.currentState = 'no_start'
+      clearWatchdog()
+      imageGeneration.stopping = true
+      try {
+        await comfyFetch(`${comfyBaseUrl.value}/queue`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ clear: true }),
+        })
+        await comfyFetch(`${comfyBaseUrl.value}/interrupt`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        })
+      } catch (error) {
+        // Best-effort: even if the cancel request fails (e.g. backend already
+        // gone), we still locally settle the in-flight items below so the UI is
+        // never left stuck in a processing state.
+        errors.report(error, {
+          category: 'generation',
+          code: 'generation/cancel-failed',
+          userMessage: 'Could not reach the ComfyUI backend to cancel generation.',
+          surface: 'silent',
+          context: { serviceName: 'comfyui-backend' },
+        })
+      } finally {
+        // Move in-flight items to a terminal 'stopped' state and unblock the UI.
+        imageGeneration.cancelGeneration()
+      }
     }
 
     return {

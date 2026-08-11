@@ -98,6 +98,12 @@ export function mapServiceNameToDisplayName(serviceName: string) {
       return 'Llama.cpp - GGUF'
     case 'openvino-backend':
       return 'OpenVINO'
+    case 'home-agent-backend':
+      return 'Home Agent'
+    case 'qwen3-tts-backend':
+      return 'Text To Speech'
+    case 'cloud-mode':
+      return 'Cloud Mode'
     default:
       return serviceName
   }
@@ -150,6 +156,11 @@ export function getTranslationLabel(prefix: string, label: string) {
 export async function checkIfNsfwBlocked(imageUrl: string): Promise<boolean> {
   return new Promise((resolve) => {
     const img = new Image()
+    // Generated `imageUrl`s are `aipg-media://…`, which is a cross-origin
+    // scheme. Without CORS opt-in, `drawImage` taints the canvas and the
+    // following `getImageData` throws `SecurityError`. `aipg-media` is
+    // registered as `corsEnabled` with `Access-Control-Allow-Origin: *`.
+    img.crossOrigin = 'anonymous'
 
     img.onload = () => {
       // Check if image is exactly 512x512
@@ -230,19 +241,38 @@ export function isImageUrl(url: string | undefined | null): boolean {
 }
 
 /**
+ * Builds an `aipg-media://` URL for a path relative to the media directory.
+ *
+ * The media-relative path MUST live in the URL *path*, under a constant
+ * `media` authority — never in the authority itself. `aipg-media` is
+ * registered as a *standard* scheme (see `registerSchemesAsPrivileged` in
+ * `electron/main.ts`), and Chromium lowercases the authority of standard URLs.
+ * Putting a case-sensitive filename there (e.g. ComfyUI's `ComfyUI_00001_.png`)
+ * therefore resolves to `comfyui_00001_.png`, which silently works on
+ * case-insensitive filesystems (Windows/macOS) but fails with
+ * `net::ERR_FILE_NOT_FOUND` on case-sensitive ones (Linux). Keeping the path in
+ * the URL path preserves case on every OS.
+ */
+export function mediaUrl(relativePath: string): string {
+  const normalized = relativePath.replace(/\\/g, '/').replace(/^\/+/, '')
+  const encoded = normalized.split('/').map(encodeURIComponent).join('/')
+  return `aipg-media://media/${encoded}`
+}
+
+/**
  * Saves an image data URI to media/input and returns an aipg-media URL.
  * @param dataUri - data:image/(png|jpeg|webp);base64,... string
- * @returns aipg-media://input/<filename>
+ * @returns aipg-media://media/input/<filename>
  */
 export async function saveImageToMediaInput(dataUri: string): Promise<string> {
   const pathSegment = await window.electronAPI.saveImageToMediaInput(dataUri)
-  return `aipg-media://${pathSegment}`
+  return mediaUrl(pathSegment)
 }
 
 /**
  * Converts a blob URL (or any image URL) to a base64 data URI.
  * If the URL is already a base64 data URI, it returns it unchanged.
- * @param url - The URL to convert (blob:, http:, or data: URL)
+ * @param url - The URL to convert (blob:, http:, data:, or aipg-media: URL)
  * @returns A Promise that resolves to a base64 data URI
  */
 export async function imageUrlToDataUri(url: string): Promise<string> {
@@ -251,7 +281,23 @@ export async function imageUrlToDataUri(url: string): Promise<string> {
     return url
   }
 
-  // Fetch the URL and convert to base64
+  // aipg-media:// is a custom Electron protocol. Chromium blocks cross-origin
+  // fetch() to non-standard schemes from http(s) origins (e.g. dev server),
+  // so route the read through the main process instead.
+  if (url.startsWith('aipg-media://')) {
+    const result = await window.electronAPI.readAipgMediaAsBase64(url)
+    if (!result.success) {
+      throw new Error(`readAipgMediaAsBase64 failed: ${result.error}`)
+    }
+    // Strip query/fragment before extension matching — otherwise URLs like
+    // `aipg-media://img.jpg?v=2` would fall through to the png default.
+    const lower = url.toLowerCase().split(/[?#]/)[0]
+    let mime = 'image/png'
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) mime = 'image/jpeg'
+    else if (lower.endsWith('.webp')) mime = 'image/webp'
+    return `data:${mime};base64,${result.data}`
+  }
+
   const response = await fetch(url)
   const blob = await response.blob()
 
@@ -269,67 +315,111 @@ export async function imageUrlToDataUri(url: string): Promise<string> {
   })
 }
 
-export async function downscaleImageTo1MP(file: File): Promise<File> {
-  const MAX_PIXELS = 1_000_000 // 1MP
+const MAX_IMAGE_PIXELS = 1_000_000 // 1MP
 
+/** Read a Blob into a base64 data URI string. */
+function blobToDataUri(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result)
+      } else {
+        reject(new Error('Failed to convert blob to data URI'))
+      }
+    }
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(blob)
+  })
+}
+
+/**
+ * Resolve the output MIME type and JPEG/WebP quality for a downscaled image,
+ * preserving JPEG/WebP and falling back to PNG for everything else.
+ */
+function resolveDownscaleEncoding(sourceType: string | undefined): {
+  mimeType: string
+  quality: number | undefined
+} {
+  const fileType = sourceType || 'image/jpeg'
+  const isJPEG = fileType === 'image/jpeg' || fileType === 'image/jpg'
+  const isWebP = fileType === 'image/webp'
+  const mimeType = isJPEG ? 'image/jpeg' : isWebP ? 'image/webp' : 'image/png'
+  const quality = isJPEG || isWebP ? 0.92 : undefined
+  return { mimeType, quality }
+}
+
+/**
+ * Draw a loaded image onto a canvas scaled down so its pixel count does not
+ * exceed 1MP (maintaining aspect ratio) and return the resulting blob. Returns
+ * `null` when the image is already <= 1MP or when the canvas context/blob is
+ * unavailable, signalling callers to keep the original.
+ */
+function downscaleLoadedImageToBlob(
+  img: HTMLImageElement,
+  sourceType: string | undefined,
+): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    const currentPixels = img.width * img.height
+
+    // If image is already <= 1MP, keep the original (return null).
+    if (currentPixels <= MAX_IMAGE_PIXELS) {
+      resolve(null)
+      return
+    }
+
+    // Calculate new dimensions maintaining aspect ratio
+    const scale = Math.sqrt(MAX_IMAGE_PIXELS / currentPixels)
+    const newWidth = Math.round(img.width * scale)
+    const newHeight = Math.round(img.height * scale)
+
+    // Create canvas and draw resized image
+    const canvas = document.createElement('canvas')
+    canvas.width = newWidth
+    canvas.height = newHeight
+    const ctx = canvas.getContext('2d')
+
+    if (!ctx) {
+      console.error('Failed to get canvas context, using original image')
+      resolve(null)
+      return
+    }
+
+    ctx.drawImage(img, 0, 0, newWidth, newHeight)
+
+    const { mimeType, quality } = resolveDownscaleEncoding(sourceType)
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          console.error('Failed to create blob from canvas, using original image')
+          resolve(null)
+          return
+        }
+        resolve(blob)
+      },
+      mimeType,
+      quality,
+    )
+  })
+}
+
+export async function downscaleImageTo1MP(file: File): Promise<File> {
   return new Promise((resolve) => {
     const img = new Image()
     const url = URL.createObjectURL(file)
 
-    img.onload = () => {
+    img.onload = async () => {
       URL.revokeObjectURL(url)
-
-      const currentPixels = img.width * img.height
-
-      // If image is already <= 1MP, return original file
-      if (currentPixels <= MAX_PIXELS) {
+      const blob = await downscaleLoadedImageToBlob(img, file.type)
+      if (!blob) {
         resolve(file)
         return
       }
-
-      // Calculate new dimensions maintaining aspect ratio
-      const scale = Math.sqrt(MAX_PIXELS / currentPixels)
-      const newWidth = Math.round(img.width * scale)
-      const newHeight = Math.round(img.height * scale)
-
-      // Create canvas and draw resized image
-      const canvas = document.createElement('canvas')
-      canvas.width = newWidth
-      canvas.height = newHeight
-      const ctx = canvas.getContext('2d')
-
-      if (!ctx) {
-        console.error('Failed to get canvas context, using original file')
-        resolve(file)
-        return
-      }
-
-      ctx.drawImage(img, 0, 0, newWidth, newHeight)
-
-      // Determine file type and quality
-      const fileType = file.type || 'image/jpeg'
-      const isJPEG = fileType === 'image/jpeg' || fileType === 'image/jpg'
-      const isWebP = fileType === 'image/webp'
-      const mimeType = isJPEG ? 'image/jpeg' : isWebP ? 'image/webp' : 'image/png'
-      const quality = isJPEG || isWebP ? 0.92 : undefined
-
-      // Convert canvas to blob and then to File
-      canvas.toBlob(
-        (blob) => {
-          if (!blob) {
-            console.error('Failed to create blob from canvas, using original file')
-            resolve(file)
-            return
-          }
-
-          const downscaledFile = new File([blob], file.name, {
-            type: mimeType,
-            lastModified: file.lastModified,
-          })
-          resolve(downscaledFile)
-        },
-        mimeType,
-        quality,
+      resolve(
+        new File([blob], file.name, {
+          type: blob.type,
+          lastModified: file.lastModified,
+        }),
       )
     }
 
@@ -340,5 +430,39 @@ export async function downscaleImageTo1MP(file: File): Promise<File> {
     }
 
     img.src = url
+  })
+}
+
+/**
+ * Downscale an image supplied as a base64 data URI so its pixel count does not
+ * exceed 1MP. Returns the original data URI unchanged when it is already small
+ * enough or when downscaling fails. Used for images arriving over remote
+ * channels (e.g. Home Agent) which never pass through the File-based path.
+ */
+export async function downscaleDataUriTo1MP(dataUri: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image()
+
+    img.onload = async () => {
+      const sourceType = dataUri.match(/^data:([^;,]+)[;,]/)?.[1]
+      const blob = await downscaleLoadedImageToBlob(img, sourceType)
+      if (!blob) {
+        resolve(dataUri)
+        return
+      }
+      try {
+        resolve(await blobToDataUri(blob))
+      } catch (e) {
+        console.error('Failed to encode downscaled image, using original', e)
+        resolve(dataUri)
+      }
+    }
+
+    img.onerror = () => {
+      console.error('Failed to load image for downscaling, using original')
+      resolve(dataUri)
+    }
+
+    img.src = dataUri
   })
 }

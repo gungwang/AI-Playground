@@ -14,6 +14,7 @@ openvino_model_paths = {
     "openvinoLLM": "../models/LLM/openvino",
     "embedding": "../models/LLM/embedding/openVINO",
     "STT": "../models/STT",
+    "TTS": "../models/TTS",
 }
 
 # ComfyUI related paths
@@ -37,6 +38,7 @@ comfy_ui_model_paths = {
     "lora": "../models/ComfyUI/loras",
     "loras": "../models/ComfyUI/loras",
     "inpaint": "../models/ComfyUI/inpaint",
+    "openvino-image": "../models/openvino-image",
 }
 
 # Git configuration

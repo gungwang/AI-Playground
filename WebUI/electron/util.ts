@@ -1,8 +1,9 @@
 import { app } from 'electron'
 import path from 'node:path'
+import { packagedResourcesRoot } from './aipgRoot.ts'
 
 export const externalResourcesDir = () =>
-  path.resolve(app.isPackaged ? process.resourcesPath : path.join(__dirname, '../../external/'))
+  path.resolve(app.isPackaged ? packagedResourcesRoot() : path.join(__dirname, '../../external/'))
 
 export const getMediaDir = () => {
   let mediaDir: string
@@ -14,4 +15,15 @@ export const getMediaDir = () => {
     mediaDir = path.join(externalResourcesDir(), 'service', 'static', 'sd_out')
   }
   return mediaDir
+}
+
+/** Generated TTS and other agent audio (sibling to `media/`, which holds Comfy output and `input/`). */
+export const getAudioDir = () => {
+  if (process.env.USERPROFILE) {
+    return path.join(process.env.USERPROFILE, 'Documents', 'AI-Playground', 'audio')
+  }
+  if (process.env.HOME) {
+    return path.join(process.env.HOME, 'AI-Playground', 'audio')
+  }
+  return path.join(externalResourcesDir(), 'service', 'static', 'audio')
 }

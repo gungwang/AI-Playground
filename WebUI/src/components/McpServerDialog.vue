@@ -49,6 +49,20 @@
           <Label for="url">URL *</Label>
           <Input id="url" v-model="url" placeholder="https://example.com/mcp" />
         </div>
+
+        <div class="flex flex-col gap-2">
+          <Label for="instructions">Instructions (optional)</Label>
+          <Textarea
+            id="instructions"
+            v-model="instructions"
+            rows="4"
+            placeholder="e.g. Always call get_current_time before answering time-related questions."
+          />
+          <span class="text-xs text-muted-foreground">
+            Sent to the model as part of the system prompt when this server is connected. Useful for
+            telling smaller models when and how to use this server's tools.
+          </span>
+        </div>
       </div>
 
       <div class="flex justify-between gap-2">
@@ -86,9 +100,11 @@ import { ref, computed, watch } from 'vue'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { useMcp } from '@/assets/js/store/mcp'
+import { useErrors } from '@/assets/js/store/errors'
 import * as toast from '@/assets/js/toast'
 import type { McpServerConfig } from '../../electron/subprocesses/mcpServers'
 
@@ -105,17 +121,20 @@ const emits = defineEmits<{
 }>()
 
 const mcp = useMcp()
+const errors = useErrors()
 
 const transport = ref<'stdio' | 'http'>('stdio')
 const displayName = ref('')
 const command = ref('')
 const args = ref('')
 const url = ref('')
+const instructions = ref('')
 const errorMessage = ref('')
 const isSubmitting = ref(false)
 
 function populateFormFromConfig(config: McpServerConfig) {
   displayName.value = config.displayName ?? ''
+  instructions.value = config.instructions ?? ''
   if (config.type !== 'http') {
     transport.value = 'stdio'
     command.value = config.command
@@ -153,6 +172,7 @@ function resetForm() {
   command.value = ''
   args.value = ''
   url.value = ''
+  instructions.value = ''
   errorMessage.value = ''
 }
 
@@ -189,18 +209,22 @@ function getServerId(): string {
 }
 
 function buildStdioConfig(name: string, cmd: string): McpServerConfig {
+  const trimmedInstructions = instructions.value.trim()
   return {
     command: cmd,
     args: parseArgs(args.value),
     displayName: name,
+    ...(trimmedInstructions ? { instructions: trimmedInstructions } : {}),
   }
 }
 
 function buildHttpConfig(name: string, httpUrl: string): McpServerConfig {
+  const trimmedInstructions = instructions.value.trim()
   return {
     type: 'http',
     url: httpUrl,
     displayName: name,
+    ...(trimmedInstructions ? { instructions: trimmedInstructions } : {}),
   }
 }
 
@@ -243,7 +267,14 @@ async function handleSubmit() {
       error instanceof Error
         ? error.message
         : `Failed to ${isAddMode.value ? 'add' : 'update'} server`
-    toast.error(errorMessage.value)
+    // The dialog renders errorMessage inline, so report as 'inline' to centralize
+    // logging/de-duplication without a redundant toast.
+    errors.report(error, {
+      category: 'backend',
+      code: `backend/mcp-${isAddMode.value ? 'add' : 'update'}-failed`,
+      surface: 'inline',
+      userMessage: errorMessage.value,
+    })
   } finally {
     isSubmitting.value = false
   }
@@ -278,7 +309,11 @@ async function handleRemove() {
     emits('update:open', false)
     resetForm()
   } catch (error) {
-    toast.error(error instanceof Error ? error.message : 'Failed to remove server')
+    errors.report(error, {
+      category: 'backend',
+      code: 'backend/mcp-remove-failed',
+      userMessage: error instanceof Error ? error.message : 'Failed to remove server',
+    })
   } finally {
     isSubmitting.value = false
   }
