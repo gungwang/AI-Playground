@@ -62,6 +62,23 @@ export type ComfyUiVariant = 'xpu' | 'cuda' | 'cpu'
 
 export const COMFYUI_DEFAULT_PARAMETERS = '--lowvram --reserve-vram 6.0'
 
+const XPU_PROBE_MAX_ATTEMPTS = 3
+const XPU_PROBE_RETRY_DELAY_MS = 500
+
+export async function probeXpuDevicesWithRetries(
+  probe: () => Promise<boolean>,
+  wait: (milliseconds: number) => Promise<void> = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= XPU_PROBE_MAX_ATTEMPTS; attempt++) {
+    if (await probe()) return true
+    if (attempt < XPU_PROBE_MAX_ATTEMPTS) {
+      await wait(XPU_PROBE_RETRY_DELAY_MS)
+    }
+  }
+  return false
+}
+
 const UPSTREAM_PYPROJECT_BACKUP = 'pyproject.toml.aipg-upstream'
 
 // ---------------------------------------------------------------------------
@@ -237,6 +254,7 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
   private comfyUiParametersString: string = COMFYUI_DEFAULT_PARAMETERS
   private comfyUiVariant: ComfyUiVariant = 'xpu'
   private variantMismatchToastSent = false
+  private xpuDeviceDetection: Promise<void> | null = null
 
   // Tri-state record of whether a torch.xpu device probe has positively
   // confirmed at least one usable Intel GPU. `null` = not probed yet (or last
@@ -1478,7 +1496,7 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
       return
     }
 
-    await this.detectXpuDevicesWithTorch()
+    await this.detectXpuDevices()
   }
 
   private async detectCudaDevicesWithTorch(): Promise<void> {
@@ -1571,7 +1589,35 @@ except Exception as e:
     this.updateStatus()
   }
 
-  private async detectXpuDevicesWithTorch(): Promise<void> {
+  private async detectXpuDevices(): Promise<void> {
+    if (this.xpuDeviceDetection) return this.xpuDeviceDetection
+
+    this.xpuDeviceDetection = this.detectXpuDevicesWithRetries().finally(() => {
+      this.xpuDeviceDetection = null
+    })
+    return this.xpuDeviceDetection
+  }
+
+  private async detectXpuDevicesWithRetries(): Promise<void> {
+    if (await probeXpuDevicesWithRetries(() => this.detectXpuDevicesWithTorch())) {
+      return
+    }
+
+    // A transient Level Zero probe must not permanently switch an XPU installation
+    // to CPU. Only fall back after all bounded retries have failed.
+    this.usableXpuConfirmed = false
+    this.comfyUiVariant = 'cpu'
+    this.devices = [{ id: '*', name: 'Auto select device', selected: true }]
+    this.appLogger.warn(
+      `[comfyui-variant] torch.xpu found 0 XPU devices after ${XPU_PROBE_MAX_ATTEMPTS} attempts. ` +
+        'Falling back to CPU. Restart ComfyUI after verifying the Intel GPU driver is available.',
+      this.name,
+      true,
+    )
+    this.updateStatus()
+  }
+
+  private async detectXpuDevicesWithTorch(): Promise<boolean> {
     let allDevices: Device[] = []
     try {
       const pythonScript = `
@@ -1658,22 +1704,8 @@ except Exception as e:
     }
     this.appLogger.info(`detected devices: ${JSON.stringify(allDevices, null, 2)}`, this.name)
     if (allDevices.length === 0) {
-      // torch.xpu.device_count() returned 0 — Level Zero loader is present but the
-      // Intel GPU driver can't enumerate any devices (missing intel-level-zero-gpu,
-      // wrong permissions on /dev/dri/renderD128, or driver mismatch). Running as
-      // XPU variant with 0 devices would crash ComfyUI; fall back to CPU instead.
-      this.appLogger.warn(
-        '[comfyui-variant] torch.xpu found 0 XPU devices — Intel GPU not accessible via Level Zero. ' +
-          'Falling back to CPU. Check: (1) intel-level-zero-gpu package installed, ' +
-          '(2) user is in the "render" group, (3) /dev/dri/renderD128 permissions.',
-        this.name,
-        true,
-      )
       this.usableXpuConfirmed = false
-      this.comfyUiVariant = 'cpu'
-      this.devices = [{ id: '*', name: 'Auto select device', selected: true }]
-      this.updateStatus()
-      return
+      return false
     }
     // A device probe positively confirmed at least one usable XPU device, so it
     // is safe for spawnAPIProcess() to launch as the XPU variant.
@@ -1702,6 +1734,7 @@ except Exception as e:
       this.settings.lastSelectedDeviceUuidPerBackend[this.name],
     )
     this.updateStatus()
+    return true
   }
 
   /**
@@ -1784,7 +1817,7 @@ except Exception as e:
       this.comfyUiVariant === 'xpu' &&
       this.usableXpuConfirmed !== true
     ) {
-      await this.detectXpuDevicesWithTorch()
+      await this.detectXpuDevices()
     }
 
     // Ensure non-XPU variants don't keep stale ipex_to_cuda injection from previous installs.
