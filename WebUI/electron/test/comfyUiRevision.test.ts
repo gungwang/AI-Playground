@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeComfyUiRef, useLockedComfyUiDeps } from '../subprocesses/comfyUiRevision'
+import {
+  COMFYUI_LOCKED_DEPS_VERSION,
+  isComfyUiDepsMarkerCurrent,
+  normalizeComfyUiRef,
+  useLockedComfyUiDeps,
+} from '../subprocesses/comfyUiRevision'
 
 describe('normalizeComfyUiRef', () => {
   it('trims and lowercases version tags', () => {
@@ -19,5 +24,36 @@ describe('useLockedComfyUiDeps', () => {
 
   it('is false when refs differ', () => {
     expect(useLockedComfyUiDeps('v0.17.0', 'v0.10.0')).toBe(false)
+  })
+})
+
+describe('isComfyUiDepsMarkerCurrent', () => {
+  it('requires a dependency contract version for locked installs', () => {
+    expect(
+      isComfyUiDepsMarkerCurrent({
+        mode: 'locked',
+        revision: 'v0.25.1',
+      }),
+    ).toBe(false)
+  })
+
+  it('accepts the current locked dependency contract', () => {
+    expect(
+      isComfyUiDepsMarkerCurrent({
+        dependencyVersion: COMFYUI_LOCKED_DEPS_VERSION,
+        mode: 'locked',
+        revision: 'v0.25.1',
+      }),
+    ).toBe(true)
+  })
+
+  it('rejects an earlier locked dependency contract', () => {
+    expect(
+      isComfyUiDepsMarkerCurrent({
+        dependencyVersion: COMFYUI_LOCKED_DEPS_VERSION - 1,
+        mode: 'locked',
+        revision: 'v0.25.1',
+      }),
+    ).toBe(false)
   })
 })

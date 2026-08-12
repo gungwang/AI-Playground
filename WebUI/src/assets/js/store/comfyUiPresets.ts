@@ -33,6 +33,7 @@ import {
   normalizeModelPathsInWorkflow,
   workflowUsesOvmsImage,
 } from './comfyUiWorkflowTransforms'
+import { createGenerationIdleWatchdog } from './generationWatchdog'
 
 /**
  * Wraps fetch() with the ComfyUI loopback bearer token. The bundled
@@ -158,40 +159,37 @@ export const useComfyUiPresets = defineStore(
       },
     )
 
-    // Watchdog: if a generation neither completes nor errors within this window,
-    // we assume the backend is wedged and fail the in-flight items so the UI and
-    // any LLM tool call waiting on completion are released instead of hanging.
-    const GENERATION_WATCHDOG_MS = 10 * 60 * 1000
-    let watchdogTimer: ReturnType<typeof setTimeout> | null = null
+    // Watchdog: fail a stalled generation, but let slow workflows continue while
+    // ComfyUI keeps reporting execution activity.
+    const GENERATION_IDLE_TIMEOUT_MS = 10 * 60 * 1000
     // Set while we intentionally restart ComfyUI mid-generate (to install custom
     // nodes), so crash detection doesn't mistake the planned bounce for a crash.
     let backendRestarting = false
 
+    const generationWatchdog = createGenerationIdleWatchdog(GENERATION_IDLE_TIMEOUT_MS, () => {
+      if (!imageGeneration.processing) return
+      const promptStore = usePromptStore()
+      promptStore.promptSubmitted = false
+      imageGeneration.failGeneration('Image generation timed out.')
+      errors.report(
+        createAppError({
+          category: 'generation',
+          code: 'generation/timeout',
+          userMessage:
+            'Image generation timed out. The ComfyUI backend may be stuck — try again or restart it.',
+          surface: 'toast',
+        }),
+      )
+    })
+
     function clearWatchdog() {
-      if (watchdogTimer !== null) {
-        clearTimeout(watchdogTimer)
-        watchdogTimer = null
-      }
+      generationWatchdog.stop()
     }
 
     function armWatchdog() {
-      clearWatchdog()
-      watchdogTimer = setTimeout(() => {
-        watchdogTimer = null
-        if (!imageGeneration.processing) return
-        const promptStore = usePromptStore()
-        promptStore.promptSubmitted = false
-        imageGeneration.failGeneration('Image generation timed out.')
-        errors.report(
-          createAppError({
-            category: 'generation',
-            code: 'generation/timeout',
-            userMessage:
-              'Image generation timed out. The ComfyUI backend may be stuck — try again or restart it.',
-            surface: 'toast',
-          }),
-        )
-      }, GENERATION_WATCHDOG_MS)
+      if (imageGeneration.processing) {
+        generationWatchdog.recordActivity()
+      }
     }
     const comfyBaseUrl = computed(() => comfyUiState.value?.baseUrl)
 
@@ -599,6 +597,7 @@ export const useComfyUiPresets = defineStore(
               case 'status':
                 break
               case 'progress':
+                armWatchdog()
                 imageGeneration.currentState = 'generating'
                 imageGeneration.stepText = `${i18nState.COM_GENERATING} ${msg.data.value}/${msg.data.max}`
                 if (generationActivityId && msg.data.max > 0) {
@@ -610,6 +609,7 @@ export const useComfyUiPresets = defineStore(
                 console.log('progress', { data: msg.data })
                 break
               case 'executing':
+                armWatchdog()
                 const executingNode = msg.data.node
                 console.log('executing', {
                   detail: msg.data.display_node || executingNode,

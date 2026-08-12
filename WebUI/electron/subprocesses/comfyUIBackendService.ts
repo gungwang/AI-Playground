@@ -23,6 +23,8 @@ import {
 } from './uvBasedBackends/uv.ts'
 import {
   COMFYUI_DEPS_MARKER_FILENAME,
+  COMFYUI_LOCKED_DEPS_VERSION,
+  isComfyUiDepsMarkerCurrent,
   normalizeComfyUiRef,
   useLockedComfyUiDeps,
   type ComfyUiDepsMarker,
@@ -540,6 +542,15 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
       const marker = await this.readDepsMarker()
       const normRev = normalizeComfyUiRef(this.revision)
       const markerMatches = marker?.revision === normRev
+      const markerDependenciesCurrent = marker ? isComfyUiDepsMarkerCurrent(marker) : false
+
+      if (marker?.mode === 'locked' && !markerDependenciesCurrent) {
+        this.appLogger.info(
+          'ComfyUI locked dependency contract changed, reinstallation needed',
+          this.name,
+        )
+        return false
+      }
 
       if (marker?.mode === 'flexible') {
         if (!markerMatches) {
@@ -995,6 +1006,9 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
       const normRev = normalizeComfyUiRef(this.revision)
       const existingMarker = await this.readDepsMarker()
       const markerMatches = existingMarker?.revision === normRev
+      const markerDependenciesCurrent = existingMarker
+        ? isComfyUiDepsMarkerCurrent(existingMarker)
+        : false
       const installedVariant = this.readInstalledVariant()
       const variantChanged = installedVariant !== null && installedVariant !== this.comfyUiVariant
 
@@ -1007,7 +1021,12 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
 
       if (useLocked) {
         let needsInstall = true
-        if (existingMarker?.mode === 'locked' && markerMatches && !variantChanged) {
+        if (
+          existingMarker?.mode === 'locked' &&
+          markerMatches &&
+          markerDependenciesCurrent &&
+          !variantChanged
+        ) {
           try {
             await checkBackend(this.serviceFolder, this.comfyUiVariant)
             needsInstall = false
@@ -1044,7 +1063,11 @@ export class ComfyUiBackendService extends LongLivedPythonApiService {
             })
           })
         }
-        await this.writeDepsMarker({ mode: 'locked', revision: normRev })
+        await this.writeDepsMarker({
+          mode: 'locked',
+          revision: normRev,
+          dependencyVersion: COMFYUI_LOCKED_DEPS_VERSION,
+        })
       } else {
         let needsInstall = true
         if (

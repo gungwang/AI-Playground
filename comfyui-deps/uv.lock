@@ -123,7 +123,7 @@ wheels = [
 
 [[package]]
 name = "aipg-comfyui"
-version = "0.17.0"
+version = "0.25.1"
 source = { virtual = "." }
 dependencies = [
     { name = "addict", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
@@ -146,6 +146,7 @@ dependencies = [
     { name = "fvcore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "gguf", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "gitpython", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
+    { name = "glfw", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "imageio-ffmpeg", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "importlib-metadata", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
@@ -174,6 +175,7 @@ dependencies = [
     { name = "pydantic", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "pydantic-settings", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "pygithub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
+    { name = "pyopengl", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "python-dateutil", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "requests", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
@@ -256,6 +258,7 @@ requires-dist = [
     { name = "fvcore" },
     { name = "gguf", specifier = ">=0.13.0" },
     { name = "gitpython", specifier = ">=3.1.57" },
+    { name = "glfw" },
     { name = "huggingface-hub", specifier = ">0.20" },
     { name = "imageio-ffmpeg" },
     { name = "importlib-metadata" },
@@ -284,11 +287,12 @@ requires-dist = [
     { name = "pydantic", specifier = "~=2.0" },
     { name = "pydantic-settings", specifier = "~=2.0" },
     { name = "pygithub" },
+    { name = "pyopengl" },
     { name = "python-dateutil" },
     { name = "pyyaml" },
     { name = "requests" },
     { name = "rich" },
-    { name = "safetensors", specifier = ">=0.8.0rc0" },
+    { name = "safetensors", specifier = ">=0.8.0" },
     { name = "scikit-image" },
     { name = "scikit-learn" },
     { name = "scipy" },
@@ -298,7 +302,7 @@ requires-dist = [
     { name = "simpleeval", specifier = ">=1.0.0" },
     { name = "soxr", specifier = "<1.0.0" },
     { name = "spandrel" },
-    { name = "sqlalchemy" },
+    { name = "sqlalchemy", specifier = ">=2.0.0" },
     { name = "stringzilla", specifier = "==3.12.6" },
     { name = "svglib", marker = "sys_platform != 'linux'" },
     { name = "timm", specifier = ">=0.9.2" },
@@ -321,7 +325,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform != 'darwin' and extra == 'xpu'", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "aipg-comfyui", extra = "xpu" } },
     { name = "torchvision", marker = "extra == 'cpu'", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "aipg-comfyui", extra = "cpu" } },
     { name = "tqdm" },
-    { name = "transformers", extras = ["timm"], specifier = ">=4.50.3" },
+    { name = "transformers", extras = ["timm"], specifier = ">=4.50.3,<5" },
     { name = "trimesh", extras = ["easy"] },
     { name = "triton-xpu", marker = "sys_platform != 'darwin' and extra == 'xpu'", specifier = ">=3.6.0", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "aipg-comfyui", extra = "xpu" } },
     { name = "typer" },
@@ -1099,6 +1103,22 @@ wheels = [
 ]
 
 [[package]]
+name = "glfw"
+version = "2.10.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/62/096058bcb4b4fb28f7ecd28fb048f07969d90b243c417af5f6d09d45a0c2/glfw-2.10.2.tar.gz", hash = "sha256:5d2cf97c66bc42a6b583be0e307eae5a3945438322e2ed0c5e4f14dc251d693d", size = 36307, upload-time = "2026-07-21T14:42:36.732Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/80/5e575ec14f54dc0a644e7215985b9ee7c5044fcc3594d6b83dfdeb04ccd4/glfw-2.10.2-py2.py3-none-macosx_10_6_intel.whl", hash = "sha256:a04d25bb535a3a29e173ea1abd658e161681b5d3816e00bc51c122f74cd7fa3a", size = 110295, upload-time = "2026-07-21T14:42:25.625Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/2e/22216db429690aa51fa87d2e2b5e6b610c5a37b9df7768da2927f52f8704/glfw-2.10.2-py2.py3-none-macosx_11_0_arm64.whl", hash = "sha256:c000b8a5e5fb4374b2c18d12347255ccb92001b9bcf80ef74c56072acbb98fe3", size = 107146, upload-time = "2026-07-21T14:42:26.854Z" },
+    { url = "https://files.pythonhosted.org/packages/75/a4/9ccee9d5c3b9c5d6bafce3e8d53ab8318eff30124e3c19b95580bebaa6d4/glfw-2.10.2-py2.py3-none-manylinux2014_aarch64.whl", hash = "sha256:0ffe2b48b51f37b05e8f027f57c0b8cd213affaf22fc83401bd9621692d4c6c8", size = 235005, upload-time = "2026-07-21T14:42:27.955Z" },
+    { url = "https://files.pythonhosted.org/packages/77/44/37aeed50c581c76e1c5bb83b696a06f98f8ecc979ed8564dde3eef908e8b/glfw-2.10.2-py2.py3-none-manylinux2014_x86_64.whl", hash = "sha256:82daf1f87b2a48815637dc6f6720d4a55a57ba1d3683322dc20dc28065754f97", size = 246951, upload-time = "2026-07-21T14:42:29.107Z" },
+    { url = "https://files.pythonhosted.org/packages/52/fc/29b4f1a8c8e33d8934781330a0845458b01da7f389d9fe6a3350e752b7f3/glfw-2.10.2-py2.py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:7604425ec95665cc6a25c3ed7d07e9660d394a34472ceffaec0843c844e7b649", size = 236018, upload-time = "2026-07-21T14:42:30.623Z" },
+    { url = "https://files.pythonhosted.org/packages/69/84/1b98671314ea5f40397586b6cd14db913de3196333be558fdc177e61708f/glfw-2.10.2-py2.py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:b860de3ca0686182483f98f3ddd12e660acf25b3e0d521450ec9a3f999f72a65", size = 248490, upload-time = "2026-07-21T14:42:32.377Z" },
+    { url = "https://files.pythonhosted.org/packages/12/d9/bd2e6c8dbadcf69fcd2289705e75881258b46221c196903a52e9f6e97322/glfw-2.10.2-py2.py3-none-win32.whl", hash = "sha256:a94aefe8c48886fd83cd6e11e936846166a4b5b94abf1f4bf599d984774b0b1b", size = 557654, upload-time = "2026-07-21T14:42:33.903Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/6c/4ca5f3ab85a8d7f612ce857208726e9b834e54e559751e3d4f98cc2f7509/glfw-2.10.2-py2.py3-none-win_amd64.whl", hash = "sha256:15fd0666cd8f1b0ecb535c3abb712b8ddda053bf8d16de2353b1c6ced0e65402", size = 564433, upload-time = "2026-07-21T14:42:35.465Z" },
+]
+
+[[package]]
 name = "greenlet"
 version = "3.5.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1193,23 +1213,21 @@ wheels = [
 
 [[package]]
 name = "huggingface-hub"
-version = "1.20.1"
+version = "0.36.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "filelock", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "fsspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
-    { name = "hf-xet", marker = "(platform_machine == 'AMD64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'darwin') or (platform_machine == 'amd64' and sys_platform == 'darwin') or (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'amd64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'aarch64' and sys_platform == 'win32') or (platform_machine == 'amd64' and sys_platform == 'win32') or (platform_machine == 'arm64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'darwin' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform == 'darwin' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'darwin' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
-    { name = "httpx", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
+    { name = "hf-xet", marker = "(platform_machine == 'aarch64' and sys_platform == 'darwin') or (platform_machine == 'amd64' and sys_platform == 'darwin') or (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'amd64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'win32') or (platform_machine == 'amd64' and sys_platform == 'win32') or (platform_machine == 'arm64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'darwin' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform == 'darwin' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'darwin' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
+    { name = "requests", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
-    { name = "typer", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e6/7e/fad82ad491b226e832d2da90a1a59f36acd4526cda8c726f639834754aa4/huggingface_hub-1.20.1.tar.gz", hash = "sha256:9f6d63bfbeab2d2a8357200a9bc4f18cd2c8bfac9579f792f5922e77bf6471d0", size = 859910, upload-time = "2026-06-18T22:06:53.348Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7c/b7/8cb61d2eece5fb05a83271da168186721c450eb74e3c31f7ef3169fa475b/huggingface_hub-0.36.2.tar.gz", hash = "sha256:1934304d2fb224f8afa3b87007d58501acfda9215b334eed53072dd5e815ff7a", size = 649782, upload-time = "2026-02-06T09:24:13.098Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/b5/ff8516e74b459da3dce9567540c39f2d305ee7a2655109f6802873ff1588/huggingface_hub-1.20.1-py3-none-any.whl", hash = "sha256:274448a45c1ba6f112fe2fb168ead05574c654faa156904157a84085cfae14bd", size = 719837, upload-time = "2026-06-18T22:06:51.486Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/af/48ac8483240de756d2438c380746e7130d1c6f75802ef22f3c6d49982787/huggingface_hub-0.36.2-py3-none-any.whl", hash = "sha256:48f0c8eac16145dfce371e9d2d7772854a4f591bcb56c9cf548accf531d54270", size = 566395, upload-time = "2026-02-06T09:24:11.133Z" },
 ]
 
 [[package]]
@@ -2690,6 +2708,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyopengl"
+version = "3.1.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/16/912b7225d56284859cd9a672827f18be43f8012f8b7b932bc4bd959a298e/pyopengl-3.1.10.tar.gz", hash = "sha256:c4a02d6866b54eb119c8e9b3fb04fa835a95ab802dd96607ab4cdb0012df8335", size = 1915580, upload-time = "2025-08-18T02:33:01.76Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/de/e4/1ba6f44e491c4eece978685230dde56b14d51a0365bc1b774ddaa94d14cd/pyopengl-3.1.10-py3-none-any.whl", hash = "sha256:794a943daced39300879e4e47bd94525280685f42dbb5a998d336cfff151d74f", size = 3194996, upload-time = "2025-08-18T02:32:59.902Z" },
+]
+
+[[package]]
 name = "pyparsing"
 version = "3.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3302,7 +3329,7 @@ wheels = [
 
 [[package]]
 name = "timm"
-version = "1.0.27"
+version = "1.0.19"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
@@ -3319,9 +3346,9 @@ dependencies = [
     { name = "torchvision", version = "0.28.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-cuda') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "torchvision", version = "0.28.0+xpu", source = { registry = "https://download.pytorch.org/whl/xpu" }, marker = "(sys_platform == 'linux' and extra == 'extra-12-aipg-comfyui-xpu') or (sys_platform == 'win32' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/08/54/ece85b0eef3700c90db8271a43669b05a0ebbe2edb1962329c34374a297e/timm-1.0.27.tar.gz", hash = "sha256:315dfe63186ca9fb7ff941268941231fd5be259f2b4bb4afa28560ae1015cb9a", size = 2439861, upload-time = "2026-05-08T19:38:36.844Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1c/78/0789838cf20ba1cc09907914a008c1823d087132b48aa1ccde5e7934175a/timm-1.0.19.tar.gz", hash = "sha256:6e71e1f67ac80c229d3a78ca58347090514c508aeba8f2e2eb5289eda86e9f43", size = 2353261, upload-time = "2025-07-24T03:04:05.281Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/2e/26bab7686ff4aed48f8f5f6c23e2aa37b7a37ddd9effe3aa61e908fd518f/timm-1.0.27-py3-none-any.whl", hash = "sha256:5ff07c9ddf53cbada88eab1c93ff175c64cab683b5a2fddf863bcee985926f89", size = 2589280, upload-time = "2026-05-08T19:38:35.034Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/74/661c63260cccf19ed5932e8b3f22f95ecd8bb34b9d9e6af9e1e7b961f254/timm-1.0.19-py3-none-any.whl", hash = "sha256:c07b56c32f3d3226c656f75c1b5479c08eb34eefed927c82fd8751a852f47931", size = 2497950, upload-time = "2025-07-24T03:04:03.097Z" },
 ]
 
 [[package]]
@@ -3720,22 +3747,23 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.12.1"
+version = "4.57.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "filelock", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "regex", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
+    { name = "requests", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "safetensors", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "tokenizers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
     { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
-    { name = "typer", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-cuda') or (extra == 'extra-12-aipg-comfyui-cpu' and extra == 'extra-12-aipg-comfyui-xpu') or (extra == 'extra-12-aipg-comfyui-cuda' and extra == 'extra-12-aipg-comfyui-xpu')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/7c/8240f612819718100a9346dc28dea6a11370c3ca9c8c6eabadd3dea4ef29/transformers-5.12.1.tar.gz", hash = "sha256:679ee731c8225347889ad4fb3b2c926a62e9da3b7d284e9d12c791da7272466b", size = 8924054, upload-time = "2026-06-15T17:27:50.604Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c4/35/67252acc1b929dc88b6602e8c4a982e64f31e733b804c14bc24b47da35e6/transformers-4.57.6.tar.gz", hash = "sha256:55e44126ece9dc0a291521b7e5492b572e6ef2766338a610b9ab5afbb70689d3", size = 10134912, upload-time = "2026-01-16T10:38:39.284Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/56/bbd60dd8668055803bf8ba55a81f9b8a8b31497f620109a9671d26a2076d/transformers-5.12.1-py3-none-any.whl", hash = "sha256:2a5e109d2021265df7098ffbb738295acaf5ad256f12cbc586db2ea4dcbb1a8a", size = 11150587, upload-time = "2026-06-15T17:27:46.679Z" },
+    { url = "https://files.pythonhosted.org/packages/03/b8/e484ef633af3887baeeb4b6ad12743363af7cce68ae51e938e00aaa0529d/transformers-4.57.6-py3-none-any.whl", hash = "sha256:4c9e9de11333ddfe5114bc872c9f370509198acf0b87a832a0ab9458e2bd0550", size = 11993498, upload-time = "2026-01-16T10:38:31.289Z" },
 ]
 
 [package.optional-dependencies]

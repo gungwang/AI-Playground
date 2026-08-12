@@ -2,7 +2,7 @@
 # Tested dependency set for ComfyUI: regenerate uv.lock from this tree after bumps.
 # Keep in sync with the ComfyUI git ref in WebUI/external/backend-versions.json (comfyui-backend.version).
 name = "aipg-comfyui"
-version = "0.17.0"
+version = "0.25.1"
 requires-python = "==3.12.*"
 dependencies = [
   "addict",
@@ -55,7 +55,7 @@ dependencies = [
   "pyyaml",
   "requests",
   "rich",
-  "safetensors>=0.8.0rc0",
+  "safetensors>=0.8.0",
   "scikit-image",
   "scikit-learn",
   "scipy",
@@ -68,7 +68,7 @@ dependencies = [
   "simpleeval>=1.0.0",
   "soxr<1.0.0",
   "spandrel",
-  "SQLAlchemy",
+  "SQLAlchemy>=2.0.0",
   "stringzilla==3.12.6",
   # svglib pulls in rlpycairo -> pycairo, which has no Linux wheel and would be
   # built from source (needs system cairo/pkg-config/meson). Exclude on Linux to
@@ -81,7 +81,8 @@ dependencies = [
   "toml",
   "torchsde",
   "tqdm",
-  "transformers[timm]>=4.50.3",
+  # ComfyUI v0.25.1 uses the pre-5.0 MistralConverter API for ERNIE Image.
+  "transformers[timm]>=4.50.3,<5",
   "trimesh[easy]",
   "typer",
   "typing-extensions",

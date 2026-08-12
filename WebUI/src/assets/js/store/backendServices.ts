@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import z from 'zod'
 import { demoAwareStorage } from '../demoAwareStorage'
+import { selectBackendVersionForInstall } from './backendVersionSelection'
 
 const backends = [
   'ai-backend',
@@ -364,8 +365,7 @@ export const useBackendServices = defineStore(
       const versions = versionState.value[serviceName]
       // `versionToInstall` is passed by explicit version actions (Update/Downgrade) and must win
       // over the currently-installed version — otherwise updating silently re-installs the old one.
-      const targetVersionSettings =
-        versionToInstall ?? versions.uiOverride ?? versions.installed ?? versions.target
+      const targetVersionSettings = selectBackendVersionForInstall(versions, versionToInstall)
       const serviceSettings: ServiceSettings = { serviceName, ...targetVersionSettings }
       if (serviceName === 'comfyui-backend') {
         serviceSettings.comfyUiParameters = effectiveComfyUiParameters.value
