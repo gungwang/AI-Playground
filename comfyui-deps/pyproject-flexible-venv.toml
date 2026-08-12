@@ -6,7 +6,7 @@
 name = "aipg-comfyui-flexible"
 version = "0.0.0"
 requires-python = "==3.12.*"
-dependencies = []
+dependencies = ["PyOpenGL", "glfw"]
 
 [project.optional-dependencies]
 xpu = [
